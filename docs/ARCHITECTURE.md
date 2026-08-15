@@ -16,53 +16,95 @@ BrokerPort
       +---- future broker adapter
 ```
 
-The generic core must never import `xtquant`.
+The generic core never imports `xtquant`.
 
-## What belongs in the core
+## Generic core responsibilities
 
-- order execution lifecycle;
-- durable intent and journal semantics;
-- query/recovery rules;
-- cancel/re-query rules;
+- execution lifecycle state machine;
+- durable intent / cancel intent;
+- cross-cycle client id and remark idempotency;
+- crash-safe journal;
 - cross-process execution mutex;
-- abstract safety facts and invariants;
-- broker-neutral DTOs;
+- query/recovery rules;
+- normalized broker DTOs;
+- execution evidence contract;
+- common hard-limit guard wrapper;
 - explicit-state verification.
 
-## What does not belong in the core
+## MiniQMT runtime responsibilities
 
-- trading signals;
-- portfolio target selection;
-- TGrid Core/T-Lot semantics;
-- reverse-repurchase timing logic;
-- ETF allocation models;
-- project-specific risk budgets;
-- automatic real-money enablement.
+- lazy import of the MiniQMT environment;
+- QMT userdata path validation;
+- fingerprint-only account binding;
+- exact account type/status selection;
+- `start -> connect -> subscribe` lifecycle;
+- raw QMT status normalization;
+- strict query semantics;
+- immutable callback bridge;
+- bounded serial callback event queue;
+- disconnect invalidation;
+- reconnect/account/subscription/reconcile recovery;
+- live config enable + runtime-only confirmation gate.
 
-## Production roadmap
+## Project responsibilities
 
-### v0.1 — reusable kernel
+- signal generation;
+- trading calendar/window policy;
+- fresh quote evidence;
+- project-specific cash/position rules;
+- portfolio/core-position invariants;
+- project-specific risk budgets.
 
-- generic state machine;
-- MiniQMT status profile;
-- dependency-injected adapter;
-- fake-broker tests;
-- journal/mutex/recovery;
-- explicit-state verifier.
+## Concurrency model
 
-### v0.2 — audited MiniQMT session bootstrap
+```text
+QMT callback threads
+       |
+       | immutable observation only
+       v
+bounded SerialEventQueue
+       |
+       v
+single callback/event handler
+```
 
-- validated QMT path/account binding;
-- exact account type/status checks;
-- callback/event-queue lifecycle;
-- disconnect recovery;
-- persistent account/session configuration;
-- production-shaped simulation certification.
+The order-execution transaction itself is protected by an `ExecutionMutex`
+which is acquired before journal load/create and held for the whole
+`ExecutionSession` lifetime.
 
-### v0.3 — execution service
+## Recovery authority
 
-- single-account daemon;
-- multi-strategy request isolation;
-- durable shared order registry;
-- strategy quotas and execution risk guard;
-- IPC/API boundary.
+```text
+Durable Journal + Broker Query
+```
+
+Callbacks are low-latency observations, not restart authority.
+
+## Live execution authority
+
+```text
+environment == live
+AND trusted config: live_trading_enabled == true
+AND runtime-only confirmation token matches configured SHA-256
+AND transport/account/subscription are healthy
+AND durable recovery is complete
+AND event queue is healthy
+AND project precheck evidence passes
+```
+
+No one condition is sufficient by itself.
+
+## Multi-strategy deployment
+
+The library is reusable from multiple strategy projects. If several strategies
+share one QMT account concurrently, the recommended next deployment layer is a
+single-account execution daemon/gateway around this package rather than
+allowing unrelated processes to manage the same account independently.
+
+That service layer is intentionally outside the package's core state-machine
+semantics; it can be added without changing `BrokerPort` or `ExecutionSession`.
+
+
+## Cross-project process ownership
+
+`MiniQmtRuntime` owns a QMT-path-scoped runtime mutex for its full lifetime. Project-specific `ExecutionSession` locks protect journals, while the runtime mutex prevents multiple projects from independently owning the same QMT transport/session concurrently.

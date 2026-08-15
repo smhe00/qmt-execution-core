@@ -62,7 +62,7 @@ class ExecutionSession:
         if self._open:
             return self.snapshot()
 
-        self.mutex.acquire()  # MUST precede all journal I/O.
+        self.mutex.acquire()
         try:
             self._snapshot, existed = self.journal.open()
             verification = verify_state_machine()
@@ -99,8 +99,6 @@ class ExecutionSession:
                 TradeState.REJECTED,
                 TradeState.FAILED,
             }:
-                # Durable states can be inspected as-is. A terminal cycle must
-                # be explicitly advanced with `next_cycle()`.
                 pass
             elif self._snapshot.state in {
                 TradeState.SUBMITTED,
@@ -116,9 +114,6 @@ class ExecutionSession:
             elif self._snapshot.state is TradeState.UNKNOWN:
                 self._recover_unknown()
             else:
-                # TRIGGER/PRE_CHECK imply an interrupted pre-submit transaction.
-                # No broker authority exists to prove how to resume safely, so
-                # fail closed instead of silently resetting to WAIT_TRIGGER.
                 self._transition(TradeEvent.FATAL, details={"reason": "interrupted pre-submit state"})
 
             self._open = True
@@ -139,7 +134,10 @@ class ExecutionSession:
         if self._snapshot.state is not TradeState.WAIT_TRIGGER:
             raise RuntimeError(f"cannot submit from {self._snapshot.state.value}")
         if not self.broker.execution_healthy():
-            raise RuntimeError("broker execution health is degraded")
+            raise BrokerSubmissionRejected(
+                "broker execution health is degraded; no intent was persisted"
+            )
+        self.journal.assert_identity_unused(request)
 
         self._transition(TradeEvent.TRIGGERED)
         self._transition(TradeEvent.BEGIN_PRECHECK)
@@ -159,8 +157,6 @@ class ExecutionSession:
             details={"source": "execution_guard"},
         )
 
-        # Durable data BEFORE the machine claims INTENT_PERSISTED and before the
-        # broker side effect.
         self.journal.persist_intent(request)
         self._transition(
             TradeEvent.INTENT_PERSISTED,
@@ -200,6 +196,21 @@ class ExecutionSession:
             return self.snapshot(reason=str(exc))
         return self._apply_observation(order)
 
+    def reconcile(self) -> ExecutionSnapshot:
+        self._require_open()
+        if self._snapshot.state is TradeState.UNKNOWN:
+            return self._recover_unknown()
+        if self._snapshot.state in {
+            TradeState.ACCEPTED,
+            TradeState.WORKING,
+            TradeState.PARTIALLY_FILLED,
+            TradeState.PENDING_CANCEL,
+            TradeState.CANCELLING,
+            TradeState.CANCEL_REJECTED,
+        }:
+            return self.poll()
+        return self.snapshot()
+
     def cancel(self) -> ExecutionSnapshot:
         self._require_open()
         if self._snapshot.state not in {
@@ -212,7 +223,6 @@ class ExecutionSession:
         if type(order_id) is not int or order_id <= 0:
             raise RecoveryAmbiguous("cancel requires a durable broker order id")
 
-        # Durable cancel intent before cancel side effect.
         self.journal.persist_cancel_intent()
         self._transition(TradeEvent.CANCEL_REQUESTED)
         try:
@@ -224,8 +234,6 @@ class ExecutionSession:
             self._transition(TradeEvent.CANCEL_SENT)
         else:
             self._transition(TradeEvent.CANCEL_REQUEST_REJECTED)
-
-        # Mandatory authoritative re-query regardless of cancel API response.
         return self.poll()
 
     def next_cycle(self) -> ExecutionSnapshot:
@@ -313,6 +321,9 @@ class ExecutionSession:
         intent = data.get("intent")
         if not isinstance(intent, dict):
             raise RecoveryAmbiguous("broker order exists without durable local intent")
+        durable_order_id = data.get("broker_order_id")
+        if type(durable_order_id) is int and order.order_id != durable_order_id:
+            raise RecoveryAmbiguous("broker order id conflicts with durable broker_order_id")
         if (
             order.symbol != intent.get("symbol")
             or order.side.value != intent.get("side")
@@ -322,6 +333,9 @@ class ExecutionSession:
         durable_remark = intent.get("order_remark")
         if order.order_remark and order.order_remark != durable_remark:
             raise RecoveryAmbiguous("broker order remark conflicts with durable intent")
+        durable_strategy = intent.get("strategy_id")
+        if order.strategy_name and order.strategy_name != durable_strategy:
+            raise RecoveryAmbiguous("broker strategy_name conflicts with durable intent")
 
     def _to_unknown(self, reason: str) -> None:
         if self._snapshot.state is TradeState.UNKNOWN:

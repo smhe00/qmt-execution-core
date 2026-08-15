@@ -28,4 +28,6 @@ Any state/event change requires corresponding verifier and refinement-test updat
 
 ## Production-live boundary
 
-The initial repository intentionally does not contain a production real-money bootstrap or automatic live-trading enable switch. Add such capabilities only as a separately reviewed layer.
+Production MiniQMT bootstrap exists, but real-money execution remains fail-closed by default.
+Never weaken the live double gate (`live_trading_enabled` + runtime-only confirmation),
+exact account binding/status checks, reconnect reconciliation, event-queue health, or project precheck evidence.

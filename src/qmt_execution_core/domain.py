@@ -183,6 +183,9 @@ class BrokerOrder:
     status: BrokerOrderStatus
     order_remark: str = ""
     client_order_id: str = ""
+    strategy_name: str = ""
+    order_sysid: str = ""
+    status_message: str = ""
     average_fill_price: float | None = None
 
     def __post_init__(self) -> None:
@@ -198,11 +201,88 @@ class BrokerOrder:
             raise ValueError("filled_qty must be within [0, qty]")
         if not isinstance(self.status, BrokerOrderStatus):
             object.__setattr__(self, "status", BrokerOrderStatus(self.status))
+        for name in ("order_remark", "client_order_id", "strategy_name", "order_sysid", "status_message"):
+            if type(getattr(self, name)) is not str:
+                raise ValueError(f"{name} must be a string")
         if self.average_fill_price is not None:
             if type(self.average_fill_price) not in (int, float) or isinstance(self.average_fill_price, bool):
                 raise ValueError("average_fill_price must be numeric or None")
             if not isfinite(float(self.average_fill_price)) or self.average_fill_price < 0:
                 raise ValueError("average_fill_price must be finite and non-negative")
+
+
+@dataclass(frozen=True)
+class BrokerAsset:
+    cash: float
+    frozen_cash: float
+    market_value: float
+    total_asset: float
+
+    def __post_init__(self) -> None:
+        for name in ("cash", "frozen_cash", "market_value", "total_asset"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or isinstance(value, bool):
+                raise ValueError(f"{name} must be numeric")
+            if not isfinite(float(value)) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+
+
+@dataclass(frozen=True)
+class BrokerPosition:
+    symbol: str
+    volume: int
+    can_use_volume: int
+    frozen_volume: int = 0
+    market_value: float = 0.0
+    average_price: float = 0.0
+
+    def __post_init__(self) -> None:
+        if type(self.symbol) is not str or not self.symbol:
+            raise ValueError("symbol must be a non-empty string")
+        for name in ("volume", "can_use_volume", "frozen_volume"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative plain int")
+        if self.can_use_volume > self.volume:
+            raise ValueError("can_use_volume cannot exceed volume")
+        for name in ("market_value", "average_price"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or isinstance(value, bool):
+                raise ValueError(f"{name} must be numeric")
+            if not isfinite(float(value)) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+
+
+@dataclass(frozen=True)
+class BrokerTrade:
+    order_id: int
+    symbol: str
+    side: Side
+    traded_volume: int
+    traded_price: float
+    traded_amount: float = 0.0
+    traded_id: str = ""
+    strategy_name: str = ""
+    order_remark: str = ""
+
+    def __post_init__(self) -> None:
+        if type(self.order_id) is not int or self.order_id <= 0:
+            raise ValueError("order_id must be a positive plain int")
+        if type(self.symbol) is not str or not self.symbol:
+            raise ValueError("symbol must be non-empty")
+        if not isinstance(self.side, Side):
+            object.__setattr__(self, "side", Side(self.side))
+        if type(self.traded_volume) is not int or self.traded_volume <= 0:
+            raise ValueError("traded_volume must be positive")
+        for name in ("traded_price", "traded_amount"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or isinstance(value, bool):
+                raise ValueError(f"{name} must be numeric")
+            if not isfinite(float(value)) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        for name in ("traded_id", "strategy_name", "order_remark"):
+            if type(getattr(self, name)) is not str:
+                raise ValueError(f"{name} must be a string")
 
 
 @dataclass(frozen=True)

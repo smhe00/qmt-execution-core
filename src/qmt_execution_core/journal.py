@@ -109,10 +109,38 @@ class ExecutionJournal:
         payload["updated_at"] = at
         self._write()
 
+    def assert_identity_unused(self, request: ExecutionRequest) -> None:
+        data = self.data
+        if request.client_order_id in list(data.get("used_client_order_ids") or []):
+            raise JournalIntegrityError(
+                "client_order_id was already used by an earlier durable cycle"
+            )
+        if request.order_remark in list(data.get("used_order_remarks") or []):
+            raise JournalIntegrityError(
+                "order_remark was already used by an earlier durable cycle"
+            )
+
     def persist_intent(self, request: ExecutionRequest) -> None:
+        self.assert_identity_unused(request)
         data = self.data
         if "intent" in data:
             raise JournalIntegrityError("journal already contains an intent")
+
+        used_ids = list(data.get("used_client_order_ids") or [])
+        used_remarks = list(data.get("used_order_remarks") or [])
+        if request.client_order_id in used_ids:
+            raise JournalIntegrityError(
+                "client_order_id was already used by an earlier durable cycle"
+            )
+        if request.order_remark in used_remarks:
+            raise JournalIntegrityError(
+                "order_remark was already used by an earlier durable cycle"
+            )
+
+        used_ids.append(request.client_order_id)
+        used_remarks.append(request.order_remark)
+        data["used_client_order_ids"] = used_ids[-10000:]
+        data["used_order_remarks"] = used_remarks[-10000:]
         data["intent"] = {
             "client_order_id": request.client_order_id,
             "symbol": request.symbol,
@@ -181,8 +209,13 @@ class ExecutionJournal:
         payload = self._require_open()
         current = self.data
         preserved = {}
-        if "formal_verification" in current:
-            preserved["formal_verification"] = current["formal_verification"]
+        for key in (
+            "formal_verification",
+            "used_client_order_ids",
+            "used_order_remarks",
+        ):
+            if key in current:
+                preserved[key] = current[key]
         payload["data"] = preserved
         payload["updated_at"] = datetime.now().astimezone().isoformat()
         self._write()
