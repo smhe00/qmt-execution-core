@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qmt-execution-core"
-version = "0.2.0"
+version = "0.2.1"
 description = "Reusable fail-closed trading execution core with a MiniQMT/XtQuant adapter profile"
 readme = "README.md"
 requires-python = ">=3.11"

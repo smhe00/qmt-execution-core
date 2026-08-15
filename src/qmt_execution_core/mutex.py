@@ -71,14 +71,20 @@ class ExecutionMutex:
 
     @staticmethod
     def _lock(handle: Any) -> None:
+        """Acquire the advisory lock non-blocking at byte 0.
+
+        ``seek(0)`` is REQUIRED: after ``open("a+b")`` the position is not
+        guaranteed to be 0 once the lock file has content, and locking at the
+        wrong offset makes the later ``LK_UNLCK`` (which seeks to 0) fail.
+        The earlier "write a 0 byte before locking" Windows workaround is
+        removed — combined with the post-lock ``truncate()`` in ``acquire`` it
+        deterministically poisoned a SUBSEQUENT owner's ``LK_UNLCK``
+        (PermissionError), same-process and cross-process
+        (qmt-execution-core 0.2.0 P1; reproduced 12/12).
+        """
         handle.seek(0)
         if os.name == "nt":
             import msvcrt
-            if handle.read(1) == b"":
-                handle.seek(0)
-                handle.write(b"0")
-                handle.flush()
-            handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         else:
             import fcntl

@@ -191,6 +191,52 @@ def test_restart_recovers_working_order(tmp_path):
     s2.close()
 
 
+def test_cancel_rejected_requires_requery(tmp_path):
+    # V4-B / V5 gap closure: a rejected cancel ack is NOT terminal
+    # cancellation; the order must be re-queried (never assumed) and only a
+    # confirmed broker state resolves it.
+    broker = FakeBroker()
+    broker.cancel_result = CancelRequestResult.REJECTED
+    s = session(tmp_path, broker=broker)
+    s.open()
+    out = s.submit(req())
+    oid = out.broker_order_id
+    assert out.state is TradeState.WORKING
+    out = s.cancel()
+    # rejected ack must not be treated as cancelled
+    assert out.state is not TradeState.CANCELLED
+    assert broker.orders[oid].status is BrokerOrderStatus.WORKING
+    # broker confirms the cancel on a later re-query -> poll resolves it
+    broker.orders[oid] = replace(broker.orders[oid], status=BrokerOrderStatus.CANCELLED)
+    out = s.poll()
+    assert out.state is TradeState.CANCELLED
+    s.close()
+
+
+def test_restart_recovers_cancel_pending(tmp_path):
+    # V5 gap closure: a crash during a cancel (order CANCEL_PENDING /
+    # machine CANCELLING) is recovered on restart by re-query, and the
+    # confirmed cancel resolves to CANCELLED.
+    broker = FakeBroker()
+    s1 = session(tmp_path, broker=broker)
+    s1.open()
+    out = s1.submit(req())
+    oid = out.broker_order_id
+    assert out.state is TradeState.WORKING
+    out = s1.cancel()
+    assert out.state is TradeState.CANCELLING
+    assert broker.orders[oid].status is BrokerOrderStatus.CANCEL_PENDING
+    s1.close()
+
+    s2 = session(tmp_path, broker=broker)
+    out = s2.open()
+    assert out.state is TradeState.CANCELLING  # recovered mid-cancel
+    broker.orders[oid] = replace(broker.orders[oid], status=BrokerOrderStatus.CANCELLED)
+    out = s2.poll()
+    assert out.state is TradeState.CANCELLED
+    s2.close()
+
+
 def test_release_lock_closes_session_for_new_orders(tmp_path):
     s = session(tmp_path)
     s.open()
