@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "environment": "simulation",
+  "qmt_path": "C:/path/to/userdata_mini",
+  "binding_path": "../config/account-binding.local.json",
+  "journal_path": "../runtime/demo-journal.json",
+  "lock_path": "../runtime/demo-execution.lock",
+  "strategy_name": "demo",
+  "live_trading_enabled": false,
+  "confirmation_token_sha256": "",
+  "session_id": null,
+  "query_attempts": 3,
+  "query_delay_seconds": 0.15,
+  "event_queue_size": 1024
+}

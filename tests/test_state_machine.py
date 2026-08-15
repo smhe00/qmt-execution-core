@@ -1,8 +1,11 @@
+import shutil
+from pathlib import Path
+
 import pytest
 
 from qmt_execution_core.domain import PrecheckEvidence, SessionEvidence, TradeEvent, TradeState
 from qmt_execution_core.state_machine import InvalidTransition, advance, initial_snapshot
-from qmt_execution_core.verifier import verify_state_machine
+from qmt_execution_core.verifier import execution_source_sha256, verify_state_machine
 
 
 def session_evidence():
@@ -62,3 +65,19 @@ def test_formal_verifier_reaches_fixed_point():
     assert result["unreachable_transitions"] == 0
     assert result["states_without_terminal_path"] == 0
     assert result["invariant_violations"] == 0
+
+
+def test_source_hash_is_layout_independent(tmp_path):
+    package_src = Path(__file__).resolve().parents[1] / "src" / "qmt_execution_core"
+    installed_like = tmp_path / "site-packages" / "qmt_execution_core"
+    shutil.copytree(package_src, installed_like)
+    assert execution_source_sha256(package_src) == execution_source_sha256(installed_like)
+
+
+def test_source_hash_fails_closed_when_protected_file_missing(tmp_path):
+    package_src = Path(__file__).resolve().parents[1] / "src" / "qmt_execution_core"
+    installed_like = tmp_path / "qmt_execution_core"
+    shutil.copytree(package_src, installed_like)
+    (installed_like / "miniqmt" / "runtime.py").unlink()
+    with pytest.raises(FileNotFoundError):
+        execution_source_sha256(installed_like)

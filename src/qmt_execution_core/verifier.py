@@ -17,18 +17,23 @@ from .state_machine import (
 
 
 PROTECTED_EXECUTION_SOURCES = (
-    "src/qmt_execution_core/domain.py",
-    "src/qmt_execution_core/exceptions.py",
-    "src/qmt_execution_core/state_machine.py",
-    "src/qmt_execution_core/ports.py",
-    "src/qmt_execution_core/journal.py",
-    "src/qmt_execution_core/mutex.py",
-    "src/qmt_execution_core/recovery.py",
-    "src/qmt_execution_core/session.py",
-    "src/qmt_execution_core/verifier.py",
-    "src/qmt_execution_core/miniqmt/status.py",
-    "src/qmt_execution_core/miniqmt/adapter.py",
-    "src/qmt_execution_core/miniqmt/callbacks.py",
+    "domain.py",
+    "exceptions.py",
+    "state_machine.py",
+    "ports.py",
+    "guards.py",
+    "event_queue.py",
+    "journal.py",
+    "mutex.py",
+    "recovery.py",
+    "session.py",
+    "verifier.py",
+    "miniqmt/status.py",
+    "miniqmt/adapter.py",
+    "miniqmt/callbacks.py",
+    "miniqmt/binding.py",
+    "miniqmt/runtime_gate.py",
+    "miniqmt/runtime.py",
 )
 
 
@@ -142,14 +147,32 @@ def transition_spec_sha256() -> str:
     return hashlib.sha256("".join(rows).encode("utf-8")).hexdigest()
 
 
+def _resolve_package_root(source_root: Path | None) -> Path:
+    if source_root is None:
+        return Path(__file__).resolve().parent
+    root = Path(source_root).resolve()
+    candidates = (
+        root / "src" / "qmt_execution_core",
+        root / "qmt_execution_core",
+        root,
+    )
+    for candidate in candidates:
+        if (candidate / "verifier.py").is_file() and (candidate / "domain.py").is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"qmt_execution_core package root not found under {root}"
+    )
+
+
 def execution_source_sha256(source_root: Path | None = None) -> str:
-    root = source_root or Path(__file__).resolve().parents[2]
+    root = _resolve_package_root(source_root)
     digest = hashlib.sha256()
     for relative in PROTECTED_EXECUTION_SOURCES:
         path = root / relative
         if not path.is_file():
             raise FileNotFoundError(f"protected execution source missing: {relative}")
-        digest.update(relative.encode("utf-8"))
+        canonical_name = f"qmt_execution_core/{relative}"
+        digest.update(canonical_name.encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n"))
         digest.update(b"\0")

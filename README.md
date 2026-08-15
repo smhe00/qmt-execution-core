@@ -1,113 +1,204 @@
 # qmt-execution-core
 
-A reusable, fail-closed trading execution kernel with a generic order-execution state machine and a MiniQMT/XtQuant adapter profile.
+Reusable, fail-closed trading execution infrastructure for Python strategies,
+with a broker-neutral execution kernel and a production-shaped MiniQMT/XtQuant
+runtime.
 
-The package is intentionally **strategy agnostic**. A strategy decides *why/when/how much* to trade; this package decides *whether an execution is safe to attempt, how the broker lifecycle is represented, and how uncertain states are recovered*.
+The package is **strategy agnostic**:
+
+```text
+Strategy decides: why / when / how much to trade
+Execution Core decides: whether execution is safe, how order state evolves,
+                        and how uncertainty/restart/disconnect is recovered
+```
 
 ## Architecture
 
 ```text
-Strategy / Scheduler
-        |
-        | ExecutionRequest
-        v
-+-----------------------------+
-| Generic Execution Core      |
-| state machine               |
-| durable journal             |
-| execution mutex             |
-| recovery / reconciliation   |
-| formal verifier             |
-+--------------+--------------+
-               | BrokerPort
-               v
-+-----------------------------+
-| MiniQMT Adapter             |
-| XtQuant status normalization|
-| strict query semantics      |
-| callback event isolation    |
-+--------------+--------------+
-               v
-            MiniQMT
+TGrid / Reverse Repo / ETF / Rebalance / Future Strategy
+                         |
+                         | ExecutionRequest
+                         v
++--------------------------------------------------+
+| Generic Execution Core                           |
+| explicit state machine                           |
+| durable intent + cross-cycle idempotency         |
+| crash-safe journal                               |
+| cross-process execution mutex                    |
+| query-based recovery / reconciliation            |
+| formal explicit-state verifier                   |
++--------------------------+-----------------------+
+                           | BrokerPort
+                           v
++--------------------------------------------------+
+| MiniQMT Runtime                                  |
+| fingerprint-bound account selection              |
+| XtQuant status normalization                     |
+| callback -> bounded serial EventQueue             |
+| exact account health / disconnect recovery       |
+| live config gate + runtime confirmation token    |
++--------------------------+-----------------------+
+                           v
+                        MiniQMT
 ```
 
-## Safety model
+## Safety rules
 
-The core follows these rules:
+- durable intent/reservation before broker submit;
+- durable cancel intent before broker cancel;
+- `UNKNOWN` never auto-resubmits;
+- query `None` is ambiguous, not silently empty;
+- cancel API success is not terminal cancellation;
+- partial fills are preserved;
+- restart restores/reconciles instead of resetting;
+- execution mutex is acquired before journal I/O;
+- client order ids and order remarks cannot be reused across durable cycles;
+- callbacks only emit immutable observations;
+- unknown MiniQMT status values map to `UNKNOWN`;
+- a disconnect invalidates execution immediately;
+- transport reconnect alone does not restore new-order capability;
+- live execution requires config enable **and** a runtime-only token;
+- formal-model PASS does not replace runtime refinement tests.
 
-- durable intent before broker side effects;
-- `UNKNOWN` / ambiguous broker state never auto-retries;
-- cancel acknowledgement is not treated as proof of cancellation;
-- broker query is the authority for recovery;
-- unknown MiniQMT status values map to `UNKNOWN`, never to `WORKING`;
-- one execution session can be protected by a cross-process mutex;
-- journal writes are atomic (`temp -> fsync -> replace`);
-- the abstract state machine is exhaustively checked by an explicit-state verifier;
-- formal-model PASS does **not** replace runtime refinement tests.
+## Installation
 
-## MiniQMT status mapping
+```bash
+python -m pip install -e .
+```
 
-| QMT status | Value | Normalized state |
+Development:
+
+```bash
+python -m pip install -e ".[dev]"
+python -m pytest
+python -m compileall -q src tests
+qmt-execution-core verify
+```
+
+`xtquant` is intentionally **not** a PyPI dependency. It is supplied by the
+MiniQMT environment at runtime. The generic package and CI therefore remain
+testable without MiniQMT installed.
+
+## MiniQMT order status mapping
+
+| QMT | Value | Normalized |
 |---|---:|---|
 | UNREPORTED | 48 | ACCEPTED |
 | WAIT_REPORTING | 49 | ACCEPTED |
 | REPORTED | 50 | WORKING |
-| REPORTED_CANCEL | 51 | CANCELLING |
-| PARTSUCC_CANCEL | 52 | CANCELLING + partial fill |
-| PART_CANCEL | 53 | CANCELLED + preserve fill |
+| REPORTED_CANCEL | 51 | CANCEL_PENDING |
+| PARTSUCC_CANCEL | 52 | CANCEL_PENDING + partial fill |
+| PART_CANCEL | 53 | PARTIAL_CANCELLED |
 | CANCELED | 54 | CANCELLED |
 | PART_SUCC | 55 | PARTIALLY_FILLED |
 | SUCCEEDED | 56 | FILLED |
 | JUNK | 57 | REJECTED |
 | UNKNOWN | 255 | UNKNOWN |
+| unrecognized | other | UNKNOWN |
 
-## Package layers
+## Package layout
 
 ```text
 src/qmt_execution_core/
-├── domain.py          # generic DTOs / states / events
-├── state_machine.py   # transition system + invariants
-├── verifier.py        # explicit-state verification
-├── journal.py         # crash-safe durable journal
-├── mutex.py           # cross-process execution mutex
-├── ports.py           # BrokerPort protocol
-├── recovery.py        # strict broker reconciliation helpers
-├── session.py         # reusable one-execution-at-a-time session API
+├── domain.py
+├── state_machine.py
+├── session.py
+├── journal.py
+├── mutex.py
+├── recovery.py
+├── guards.py
+├── event_queue.py
+├── verifier.py
+├── ports.py
 └── miniqmt/
-    ├── status.py      # raw QMT -> normalized status
-    ├── adapter.py     # XtQuantTrader adapter (dependency injected)
-    └── callbacks.py   # callback -> immutable event queue bridge
+    ├── status.py
+    ├── adapter.py
+    ├── callbacks.py
+    ├── binding.py
+    ├── runtime_gate.py
+    └── runtime.py
 ```
 
-## Quick example with a fake/custom broker
+## Generic usage
+
+Projects can use `ExecutionSession` with any `BrokerPort`:
 
 ```python
-from pathlib import Path
-from qmt_execution_core import ExecutionRequest, ExecutionSession
-
 session = ExecutionSession(
     broker=my_broker,
-    guard=my_guard,
-    journal_path=Path("runtime/order.json"),
-    lock_path=Path("runtime/order.lock"),
+    guard=my_project_guard,
+    journal_path="runtime/order.json",
+    lock_path="runtime/order.lock",
+    execution_id="strategy-a",
 )
-
 session.open()
-snapshot = session.submit(
-    ExecutionRequest(
-        client_order_id="strategy-20260818-001",
-        symbol="510300.SH",
-        side="BUY",
-        qty=100,
-        limit_price=4.72,
-        strategy_id="demo",
-        order_remark="demo_20260818_001",
-    )
-)
 ```
 
-## Production boundary
+## MiniQMT production-shaped usage
 
-`v0.1` does **not** provide a production live-session bootstrap, account-binding policy, or a convenience switch that enables real-money trading. Those should be added as a separately reviewed layer after the reusable kernel is stable.
+Create a fingerprint-only binding locally:
 
-See [docs/STATE_MACHINE_SPEC.md](docs/STATE_MACHINE_SPEC.md) and [docs/MINIQMT_PROFILE.md](docs/MINIQMT_PROFILE.md).
+```bash
+qmt-execution-core create-binding \
+  --environment simulation \
+  --account-type 2 \
+  --qmt-path "C:/.../userdata_mini" \
+  --output config/account-binding.local.json
+```
+
+Then:
+
+```python
+from qmt_execution_core.miniqmt import MiniQmtRuntime, MiniQmtRuntimeConfig
+
+config = MiniQmtRuntimeConfig.from_json("config/runtime.local.json")
+runtime = MiniQmtRuntime.connect(config, guard=my_project_guard)
+
+try:
+    snapshot = runtime.submit(request)
+finally:
+    runtime.close()
+```
+
+For live mode, `live_trading_enabled=true` is still insufficient:
+
+```python
+runtime.confirm_live("runtime-only-token")
+```
+
+The plaintext token is never persisted by the package, and confirmation is
+revoked after disconnect/teardown.
+
+## What remains project-specific
+
+This repository does **not** contain:
+
+- signal generation;
+- grid/T-Lot/CorePosition semantics;
+- ETF allocation;
+- reverse-repurchase timing;
+- portfolio target selection;
+- project-specific cash/position/quote rules.
+
+Projects provide `ExecutionGuard` evidence and may compose it with the common
+`LimitExecutionGuard`.
+
+## Verification
+
+The explicit-state verifier proves the declared abstract state machine has:
+
+- no unreachable state/transition;
+- no reachable invariant violation;
+- a terminal path from every reachable non-terminal state;
+- no blind retry path from `UNKNOWN`.
+
+The journal also binds itself to the state-machine transition hash and all
+protected execution source files.
+
+See:
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [State-machine specification](docs/STATE_MACHINE_SPEC.md)
+- [MiniQMT profile](docs/MINIQMT_PROFILE.md)
+- [Production MiniQMT runtime](docs/PRODUCTION_RUNTIME.md)
+- [Changelog](CHANGELOG.md)

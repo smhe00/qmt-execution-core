@@ -10,6 +10,10 @@ class BrokerError(ExecutionCoreError):
     pass
 
 
+class BrokerExecutionDisabled(BrokerError):
+    """Local execution gate intentionally blocks new orders."""
+
+
 class BrokerSubmissionRejected(BrokerError):
     """Broker/API definitively rejected a submit request."""
 
@@ -23,4 +27,20 @@ class BrokerQueryAmbiguous(BrokerError):
 
 
 class RecoveryAmbiguous(ExecutionCoreError):
+    pass
+
+
+class RuntimeConfigurationError(ExecutionCoreError):
+    pass
+
+
+class AccountBindingError(ExecutionCoreError):
+    pass
+
+
+class EventQueueUnhealthy(ExecutionCoreError):
+    pass
+
+
+class RuntimeConfirmationError(ExecutionCoreError):
     pass
