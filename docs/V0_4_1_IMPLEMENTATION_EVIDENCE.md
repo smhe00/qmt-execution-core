@@ -232,3 +232,52 @@ execution_source_sha256    : daa9bafead2ad220ab11da7b40c07a00421c009c942e1b8a11d
 ast 3.9 parse              : NONE failed
 bootstrap-authority CLI    : smoke PASS (second run verifies, no rewrite)
 ```
+
+## 8. Revision 3 after independent audit (CHANGES_REQUIRED -> fixed)
+
+The rev2 candidate `54b2cbe` was audited (docs/ARCHITECT_AUDIT_V0_4_1_RUNTIME_AUTHORITY_REV2.md)
+with one remaining P1: the Windows canonical root still read
+`os.environ["LOCALAPPDATA"]`, so two processes under the same user with
+different mutable environment could resolve different Authority roots.
+Rev3 (`5cb66f3`, PR #4) fixes it:
+
+### P1 - OS-derived, non-overridable canonical root
+`default_authority_root()` no longer reads any process environment:
+
+- **Windows**: `FOLDERID_LocalAppData` via the Windows Known Folder API
+  (`SHGetKnownFolderPath` through `ctypes`; the returned pointer is freed
+  with `CoTaskMemFree(ctypes.cast(...))`).  No `%LOCALAPPDATA%` /
+  `%USERPROFILE%` / `HOME` / `Path.home()` fallback; lookup failure raises
+  `RuntimeAuthorityError` (fail closed).
+- **POSIX**: OS user-database home via `pwd.getpwuid(os.getuid())`; failure
+  raises `RuntimeAuthorityError` (no `$HOME` / `Path.home()` fallback).
+
+### P1 - production bootstrap CLI root override removed
+`qmt-execution-core bootstrap-authority` no longer accepts `--authority-root`;
+it calls the same module-level `default_authority_root()` the runtime uses.
+Tests needing an isolated root use the low-level
+`AccountRuntimeAuthority(temp_root)` / `connect(authority=...)` API.
+
+### New regressions (all PASS)
+- Windows mutable `os.environ["LOCALAPPDATA"]` between calls -> root unchanged;
+- two real OS processes carrying DIFFERENT `LOCALAPPDATA` -> same canonical root;
+- Known Folder lookup failure -> fail closed, no env fallback;
+- POSIX user-database failure -> fail closed, no `Path.home()` fallback;
+- `bootstrap-authority --help` has no `--authority-root` option;
+- explicit bootstrap (CLI) then normal runtime (no injection) resolve the
+  same canonical Authority and verify without a broker side effect.
+
+### Rev3 gates (all PASS)
+```text
+full pytest (3.12)         : 119 passed, 1 skipped (POSIX-only)
+full pytest (3.9.13 wheel) : 119 passed, 1 skipped
+compileall -q src tests    : 0
+wheel                      : qmt_execution_core-0.4.1-py3-none-any.whl
+clean-env install          : OK
+installed verify (3.12+3.9): PASS
+release formal gate        : unchanged 433,489 / 4,461,994 / 0 violations
+execution_source_sha256    : e51180b5002c6adc2215a9864b984030f8e9c59fc2fbb90cd6fee512cb98aef4
+ast 3.9 parse              : NONE failed
+PR                          : #4 (feature/0.4.1-runtime-authority ->
+                               main), head 5cb66f336bbc7d0ac4fef202d1c7b5392251ba2e
+```
