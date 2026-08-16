@@ -24,11 +24,12 @@ from .session import ExecutionSession
 
 
 class _CoordinatedBrokerPort:
-    """Broker wrapper that coordinates shared resources before submit.
+    """Broker delegate that releases resources only on definitive rejection.
 
-    The wrapped ExecutionSession still owns the reliable order lifecycle. This
-    wrapper only inserts the v0.4 shared-account critical section immediately
-    before the real BrokerPort.place_order side effect.
+    Resource acquisition itself runs through ExecutionSession's v0.4
+    ``before_submit_coordination`` seam so ordering is:
+
+        durable intent -> shared coordination -> project sidecar -> broker
     """
 
     def __init__(
@@ -38,58 +39,18 @@ class _CoordinatedBrokerPort:
         coordinator: ExecutionCoordinator,
         account_key: str,
         execution_id: str,
-        account_resource: AccountResourcePort,
-        cash_estimator: CashRequirementEstimator | None,
     ) -> None:
         self.raw_broker = broker
         self.coordinator = coordinator
         self.account_key = account_key
         self.execution_id = execution_id
-        self.account_resource = account_resource
-        self.cash_estimator = cash_estimator
 
     def place_order(self, request: ExecutionRequest) -> int:
-        broker_available_cash: float | None = None
-        required_cash: float | None = None
-
-        if request.side is Side.BUY:
-            if self.cash_estimator is None:
-                raise BrokerSubmissionRejected(
-                    "coordinated BUY requires an explicit CashRequirementEstimator; "
-                    "broker order was not invoked"
-                )
-            try:
-                asset = self.account_resource.query_asset()
-                estimate = self.cash_estimator.estimate(request, asset)
-                broker_available_cash = float(asset.cash)
-                required_cash = float(estimate.required_cash)
-            except BrokerSubmissionRejected:
-                raise
-            except Exception as exc:
-                raise BrokerSubmissionRejected(
-                    "fresh authoritative cash/requirement estimation failed; "
-                    "broker order was not invoked"
-                ) from exc
-
-        try:
-            self.coordinator.prepare(
-                account_key=self.account_key,
-                execution_id=self.execution_id,
-                request=request,
-                broker_available_cash=broker_available_cash,
-                required_cash=required_cash,
-            )
-        except CoordinationError as exc:
-            raise BrokerSubmissionRejected(
-                f"shared-account coordination rejected submit before broker side effect: {exc}"
-            ) from exc
-
         try:
             return self.raw_broker.place_order(request)
         except BrokerSubmissionRejected:
-            # Broker/API definitively says no order exists. Releasing the
-            # local claim/reservation is safe; a later order still refreshes
-            # broker cash rather than adding this reservation back locally.
+            # Broker/API definitively says no order exists.  Coordination was
+            # acquired earlier in the pre-submit seam, so it is safe to release.
             self.coordinator.update_finality(
                 account_key=self.account_key,
                 execution_id=self.execution_id,
@@ -98,12 +59,11 @@ class _CoordinatedBrokerPort:
             )
             raise
         except (BrokerSubmissionAmbiguous, BrokerError):
-            # Outcome may exist at the broker: retain claim + cash reservation.
+            # Outcome may exist at the broker: retain claim + reservation.
             raise
         except Exception as exc:
-            # A generic broker implementation violated the BrokerPort error
-            # contract. Treat it as ambiguous, never as permission to release
-            # resources or blindly resend.
+            # A generic BrokerPort implementation violated the error contract.
+            # Treat this as ambiguous and preserve shared resources.
             raise BrokerSubmissionAmbiguous(
                 "coordinated broker submit raised unexpectedly; outcome unknown"
             ) from exc
@@ -121,8 +81,6 @@ class _CoordinatedBrokerPort:
         return self.raw_broker.execution_healthy()
 
     def __getattr__(self, name: str):
-        # Preserve access to optional broker-specific read-only query surfaces
-        # (query_asset/query_positions/query_trades) without widening BrokerPort.
         return getattr(self.raw_broker, name)
 
 
@@ -158,13 +116,12 @@ class CoordinatedExecutionSession(ExecutionSession):
         self.cash_estimator = cash_estimator
         self.execution_id = execution_id
         self.raw_broker = broker
+        self._project_before_broker_submit = before_broker_submit
         coordinated_broker = _CoordinatedBrokerPort(
             broker=broker,
             coordinator=coordinator,
             account_key=account_key,
             execution_id=execution_id,
-            account_resource=account_resource,
-            cash_estimator=cash_estimator,
         )
         super().__init__(
             broker=coordinated_broker,
@@ -172,7 +129,8 @@ class CoordinatedExecutionSession(ExecutionSession):
             journal_path=journal_path,
             lock_path=lock_path,
             execution_id=execution_id,
-            before_broker_submit=before_broker_submit,
+            before_submit_coordination=self._coordinate_before_submit,
+            before_broker_submit=self._run_project_sidecar,
             before_broker_cancel=before_broker_cancel,
         )
 
@@ -192,8 +150,62 @@ class CoordinatedExecutionSession(ExecutionSession):
         return self._sync(super().cancel())
 
     def next_cycle(self) -> ExecutionSnapshot:
-        # A previous resolved transition has already released shared resources.
         return super().next_cycle()
+
+    def _coordinate_before_submit(self, request: ExecutionRequest) -> None:
+        broker_available_cash: float | None = None
+        required_cash: float | None = None
+        if request.side is Side.BUY:
+            if self.cash_estimator is None:
+                raise BrokerSubmissionRejected(
+                    "coordinated BUY requires an explicit CashRequirementEstimator; "
+                    "broker order was not invoked"
+                )
+            try:
+                asset = self.account_resource.query_asset()
+                estimate = self.cash_estimator.estimate(request, asset)
+                broker_available_cash = float(asset.cash)
+                required_cash = float(estimate.required_cash)
+            except BrokerSubmissionRejected:
+                raise
+            except Exception as exc:
+                raise BrokerSubmissionRejected(
+                    "fresh authoritative cash/requirement estimation failed; "
+                    "broker order was not invoked"
+                ) from exc
+        try:
+            self.coordinator.prepare(
+                account_key=self.account_key,
+                execution_id=self.execution_id,
+                request=request,
+                broker_available_cash=broker_available_cash,
+                required_cash=required_cash,
+            )
+        except CoordinationError as exc:
+            raise BrokerSubmissionRejected(
+                f"shared-account coordination rejected submit before broker side effect: {exc}"
+            ) from exc
+
+    def _run_project_sidecar(self, request: ExecutionRequest) -> None:
+        hook = self._project_before_broker_submit
+        if hook is None:
+            return
+        try:
+            hook(request)
+        except Exception as hook_error:
+            # The project hook is synchronous and raw broker.place_order has
+            # not been invoked. Release the shared resources immediately; the
+            # base session will record REJECTED/RESOLVED before re-raising.
+            try:
+                self.coordinator.update_finality(
+                    account_key=self.account_key,
+                    execution_id=self.execution_id,
+                    request=request,
+                    finality=ExecutionFinality.RESOLVED,
+                )
+            except Exception as release_error:
+                raise release_error from hook_error
+            raise
 
     def _durable_request(self) -> ExecutionRequest | None:
         if not self.journal.is_open:
@@ -241,9 +253,8 @@ class CoordinatedExecutionSession(ExecutionSession):
         finality = execution_finality(self.machine)
 
         if finality is ExecutionFinality.RESOLVED:
-            # A submit may have been rejected before this execution ever
-            # acquired the symbol (for example another process already owns
-            # it). Never update/delete another execution's claim.
+            # A pre-broker rejection may mean this execution never owned the
+            # symbol. Never update/delete another execution's claim.
             try:
                 owns_claim = self.coordinator.has_claim(
                     account_key=self.account_key,
@@ -274,10 +285,10 @@ class CoordinatedExecutionSession(ExecutionSession):
             )
             return snapshot
 
-        # Recovery path: if the coordination DB was recreated or the durable
-        # claim is otherwise missing, re-establish it conservatively. Existing
-        # broker orders do not re-check available cash because that cash may
-        # already be frozen/reflected by the broker.
+        # Recovery path: a genuinely unresolved execution with a missing
+        # coordination claim is restored conservatively. Existing broker orders
+        # do not re-check available cash because broker cash may already reflect
+        # their frozen amount.
         self.coordinator.restore(
             account_key=self.account_key,
             execution_id=self.execution_id,
