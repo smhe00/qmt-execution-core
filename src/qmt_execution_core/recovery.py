@@ -43,6 +43,13 @@ def event_for_observation(current: TradeState, status: BrokerOrderStatus) -> Tra
         return TradeEvent.QUERY_AMBIGUOUS
 
     if recovering:
+        # CANCEL_REJECTED does not declare RECOVERY_ACCEPTED. An ACCEPTED
+        # observation is weaker than the previously active/cancel path and is
+        # therefore treated fail-closed as QUERY_AMBIGUOUS -> UNKNOWN. A later
+        # authoritative WORKING/PARTIAL/FILLED/CANCELLED observation can recover
+        # the original execution without creating resend permission.
+        if current is TradeState.CANCEL_REJECTED and status is BrokerOrderStatus.ACCEPTED:
+            return TradeEvent.QUERY_AMBIGUOUS
         return {
             BrokerOrderStatus.ACCEPTED: TradeEvent.RECOVERY_ACCEPTED,
             BrokerOrderStatus.WORKING: TradeEvent.RECOVERY_WORKING,
