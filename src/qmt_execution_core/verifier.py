@@ -32,6 +32,7 @@ PROTECTED_EXECUTION_SOURCES = (
     "finality.py",
     "coordination.py",
     "coordinated_session.py",
+    "authority.py",
     "formal.py",
     "verifier.py",
     "miniqmt/status.py",

@@ -7,9 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from ..authority import AccountRuntimeAuthority, default_authority_root
 from ..coordinated_session import CoordinatedExecutionSession
 from ..coordination import (
     CashRequirementEstimator,
+    CoordinationDbIdentity,
     ExecutionCoordinator,
     SQLiteExecutionCoordinator,
     account_key_from_binding_identity,
@@ -64,6 +66,7 @@ _RUNTIME_OPTIONAL_FIELDS = {
     "event_queue_size",
     "runtime_lock_mode",
     "coordination_path",
+    "authority_root",
     "session_id_pool_start",
     "session_id_pool_size",
     "session_id_attempts",
@@ -87,6 +90,7 @@ class MiniQmtRuntimeConfig:
     event_queue_size: int = 1024
     runtime_lock_mode: str = "exclusive"
     coordination_path: Path | str | None = None
+    authority_root: Path | str | None = None
     session_id_pool_start: int = 100_000_000
     session_id_pool_size: int = 1_000
     session_id_attempts: int = 32
@@ -102,6 +106,17 @@ class MiniQmtRuntimeConfig:
                 self,
                 "coordination_path",
                 Path(self.coordination_path).expanduser(),
+            )
+        if self.authority_root is not None:
+            object.__setattr__(
+                self,
+                "authority_root",
+                Path(self.authority_root).expanduser(),
+            )
+        if self.coordination_path is not None and self.authority_root is not None:
+            raise RuntimeConfigurationError(
+                "coordination_path and authority_root are mutually exclusive; "
+                "production shared mode must use the Account Runtime Authority"
             )
         if type(self.strategy_name) is not str or not self.strategy_name:
             raise RuntimeConfigurationError("strategy_name must be non-empty")
@@ -165,6 +180,11 @@ class MiniQmtRuntimeConfig:
             if not value.is_absolute():
                 value = base / value
             payload["coordination_path"] = value
+        if payload.get("authority_root") is not None:
+            value = Path(str(payload["authority_root"])).expanduser()
+            if not value.is_absolute():
+                value = base / value
+            payload["authority_root"] = value
         return cls(**payload)
 
 
@@ -263,17 +283,49 @@ class MiniQmtRuntime:
             environment=config.environment,
             qmt_path=qmt_path,
         )
-        if coordinator is None and config.coordination_path is not None:
-            coordinator = SQLiteExecutionCoordinator(config.coordination_path)
-        if config.runtime_lock_mode == "shared" and coordinator is None:
-            raise RuntimeConfigurationError(
-                "shared runtime mode requires coordination_path or injected coordinator"
-            )
         account_key = account_key_from_binding_identity(
             environment=binding.environment,
             account_type=binding.account_type,
             account_id_sha256=binding.account_id_sha256,
         )
+        if coordinator is None and config.runtime_lock_mode == "shared":
+            # Core 0.4.1: production shared mode resolves the account Runtime
+            # Authority (canonical per-account path -> certified dedicated
+            # coordination DB identity).  The strategy must NOT decide the
+            # coordination DB path as proof of uniqueness.
+            if config.coordination_path is not None:
+                # Legacy explicit-path low-level mode: retained for
+                # compatibility/tests only — it carries NO coordination-domain
+                # uniqueness guarantee (documented; not the production path).
+                coordinator = SQLiteExecutionCoordinator(config.coordination_path)
+            else:
+                root = (
+                    Path(config.authority_root)
+                    if config.authority_root is not None
+                    else default_authority_root()
+                )
+                authority = AccountRuntimeAuthority(root).resolve(
+                    account_key=account_key,
+                    environment=binding.environment,
+                    account_type=binding.account_type,
+                    account_id_sha256=binding.account_id_sha256,
+                    coordination_db_path=None,
+                    bootstrap=True,
+                )
+                coordinator = SQLiteExecutionCoordinator(
+                    authority.coordination_db_path,
+                    expected_identity=CoordinationDbIdentity(
+                        schema_version=1,
+                        account_key=authority.account_key,
+                        db_uuid=authority.coordination_db_uuid,
+                        authority_id=authority.authority_id,
+                    ),
+                )
+        if config.runtime_lock_mode == "shared" and coordinator is None:
+            raise RuntimeConfigurationError(
+                "shared runtime mode requires coordination_path/authority or "
+                "an injected coordinator"
+            )
 
         gate = RuntimeExecutionGate(
             RuntimeGateConfig(

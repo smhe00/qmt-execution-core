@@ -1,11 +1,17 @@
 """Reusable fail-closed trading execution core."""
 
+from .authority import (
+    AccountAuthority,
+    AccountRuntimeAuthority,
+    default_authority_root,
+)
 from .coordinated_session import CoordinatedExecutionSession
 from .coordination import (
     CashRequirementEstimate,
     CashRequirementEstimator,
     CashReservation,
     ConservativeCashRequirementEstimator,
+    CoordinationDbIdentity,
     ExecutionCoordinator,
     SQLiteExecutionCoordinator,
     SymbolClaim,
@@ -28,6 +34,10 @@ from .domain import (
     TradeState,
 )
 from .event_queue import EventQueueState, SerialEventQueue
+from .exceptions import (
+    CoordinationIdentityError,
+    RuntimeAuthorityError,
+)
 from .finality import ExecutionFinality, execution_finality
 from .guards import ExecutionLimits, LimitExecutionGuard
 from .ports import AccountResourcePort, BrokerPort, ExecutionGuard
@@ -35,7 +45,9 @@ from .session import ExecutionSession
 from .verifier import verify_release_model, verify_state_machine
 
 __all__ = [
+    "AccountAuthority",
     "AccountResourcePort",
+    "AccountRuntimeAuthority",
     "BrokerAsset",
     "BrokerOrder",
     "BrokerOrderStatus",
@@ -48,6 +60,8 @@ __all__ = [
     "CashReservation",
     "ConservativeCashRequirementEstimator",
     "CoordinatedExecutionSession",
+    "CoordinationDbIdentity",
+    "CoordinationIdentityError",
     "EventQueueState",
     "ExecutionCoordinator",
     "ExecutionFinality",
@@ -58,6 +72,7 @@ __all__ = [
     "ExecutionSnapshot",
     "LimitExecutionGuard",
     "PrecheckEvidence",
+    "RuntimeAuthorityError",
     "SQLiteExecutionCoordinator",
     "SafetyFacts",
     "SerialEventQueue",
@@ -67,6 +82,7 @@ __all__ = [
     "TradeEvent",
     "TradeState",
     "account_key_from_binding_identity",
+    "default_authority_root",
     "execution_finality",
     "verify_release_model",
     "verify_state_machine",

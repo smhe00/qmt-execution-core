@@ -11,12 +11,14 @@ from .domain import BrokerAsset, ExecutionRequest, Side
 from .exceptions import (
     CashReservationRejected,
     CoordinationError,
+    CoordinationIdentityError,
     SymbolClaimConflict,
 )
 from .finality import ExecutionFinality
 
 
 _COORDINATION_SCHEMA_VERSION = 1
+_IDENTITY_SCHEMA_VERSION = 1
 _EPSILON = 1e-9
 
 
@@ -163,6 +165,28 @@ class ConservativeCashRequirementEstimator:
 
 
 @dataclass(frozen=True)
+class CoordinationDbIdentity:
+    """Persistent identity metadata of a dedicated coordination DB (0.4.1).
+
+    Generated once per DB instance (``db_uuid``); stable across normal
+    content changes, claims, reservations, VACUUM and WAL checkpoints.  Only
+    explicit creation of a new DB instance produces a new ``db_uuid``.
+    """
+
+    schema_version: int
+    account_key: str
+    db_uuid: str
+    authority_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version <= 0:
+            raise CoordinationError("identity schema_version must be a positive int")
+        _plain_non_empty(self.account_key, "account_key")
+        _plain_non_empty(self.db_uuid, "db_uuid")
+        _plain_non_empty(self.authority_id, "authority_id")
+
+
+@dataclass(frozen=True)
 class SymbolClaim:
     account_key: str
     symbol: str
@@ -230,13 +254,32 @@ class SQLiteExecutionCoordinator:
     SQLite ``BEGIN IMMEDIATE`` serializes the read-check-write reservation
     critical section across independent Python processes.  The database may
     contain multiple accounts; all shared resources are scoped by account_key.
+
+    Core 0.4.1: an Authority-bound coordinator is constructed with
+    ``expected_identity`` — the DB must already exist and its persistent
+    identity metadata must match exactly (account_key / db_uuid /
+    authority_id / schema_version), otherwise construction FAILS CLOSED.
+    ``expected_identity=None`` keeps the 0.4.0 legacy explicit-path mode
+    (no uniqueness guarantee).  Use :meth:`create` for the authorized
+    bootstrap of a fresh dedicated DB instance.
     """
 
-    def __init__(self, path: Path | str, *, timeout_seconds: float = 5.0) -> None:
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        timeout_seconds: float = 5.0,
+        expected_identity: CoordinationDbIdentity | None = None,
+    ) -> None:
         self.path = Path(path).expanduser().resolve(strict=False)
         if type(timeout_seconds) not in (int, float) or isinstance(timeout_seconds, bool):
             raise TypeError("timeout_seconds must be numeric")
         self.timeout_seconds = max(0.0, float(timeout_seconds))
+        if expected_identity is not None and not isinstance(
+            expected_identity, CoordinationDbIdentity
+        ):
+            raise TypeError("expected_identity must be a CoordinationDbIdentity or None")
+        self.expected_identity = expected_identity
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -250,19 +293,80 @@ class SQLiteExecutionCoordinator:
         connection.execute("PRAGMA foreign_keys=ON")
         return connection
 
+    @staticmethod
+    def _ensure_schema(connection: sqlite3.Connection) -> None:
+        """Create all coordination tables if absent (shared by init + create)."""
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS coordination_meta (
+                schema_version INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS symbol_claim (
+                account_key TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                execution_id TEXT NOT NULL,
+                client_order_id TEXT NOT NULL,
+                finality TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(account_key, symbol)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_symbol_claim_identity
+            ON symbol_claim(account_key, execution_id, client_order_id)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cash_reservation (
+                account_key TEXT NOT NULL,
+                execution_id TEXT NOT NULL,
+                client_order_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                required_cash REAL NOT NULL CHECK(required_cash >= 0),
+                active INTEGER NOT NULL CHECK(active IN (0, 1)),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                released_at TEXT,
+                PRIMARY KEY(account_key, execution_id, client_order_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS coordination_identity (
+                account_key TEXT NOT NULL,
+                db_uuid TEXT NOT NULL,
+                authority_id TEXT NOT NULL,
+                identity_schema_version INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(account_key)
+            )
+            """
+        )
+
     def _initialize(self) -> None:
         try:
+            if (
+                self.expected_identity is not None
+                and not self.path.exists()
+            ):
+                raise CoordinationIdentityError(
+                    "certified coordination DB file is missing; refusing to "
+                    "recreate or adopt a replacement at the same path"
+                )
             connection = self._connect()
             try:
                 connection.execute("PRAGMA journal_mode=WAL")
                 connection.execute("BEGIN IMMEDIATE")
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS coordination_meta (
-                        schema_version INTEGER NOT NULL
-                    )
-                    """
-                )
+                self._ensure_schema(connection)
                 row = connection.execute(
                     "SELECT schema_version FROM coordination_meta LIMIT 1"
                 ).fetchone()
@@ -274,52 +378,110 @@ class SQLiteExecutionCoordinator:
                 elif int(row["schema_version"]) != _COORDINATION_SCHEMA_VERSION:
                     raise CoordinationError("coordination schema version mismatch")
 
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS symbol_claim (
-                        account_key TEXT NOT NULL,
-                        symbol TEXT NOT NULL,
-                        execution_id TEXT NOT NULL,
-                        client_order_id TEXT NOT NULL,
-                        finality TEXT NOT NULL,
-                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        PRIMARY KEY(account_key, symbol)
-                    )
-                    """
-                )
-                connection.execute(
-                    """
-                    CREATE UNIQUE INDEX IF NOT EXISTS uq_symbol_claim_identity
-                    ON symbol_claim(account_key, execution_id, client_order_id)
-                    """
-                )
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS cash_reservation (
-                        account_key TEXT NOT NULL,
-                        execution_id TEXT NOT NULL,
-                        client_order_id TEXT NOT NULL,
-                        symbol TEXT NOT NULL,
-                        required_cash REAL NOT NULL CHECK(required_cash >= 0),
-                        active INTEGER NOT NULL CHECK(active IN (0, 1)),
-                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        released_at TEXT,
-                        PRIMARY KEY(account_key, execution_id, client_order_id)
-                    )
-                    """
-                )
+                if self.expected_identity is not None:
+                    identity = connection.execute(
+                        """
+                        SELECT account_key, db_uuid, authority_id,
+                               identity_schema_version
+                        FROM coordination_identity
+                        LIMIT 1
+                        """
+                    ).fetchone()
+                    if identity is None:
+                        raise CoordinationIdentityError(
+                            "coordination DB has no authority identity metadata "
+                            "(legacy 0.4.0 DB is not silently adopted)"
+                        )
+                    expected = self.expected_identity
+                    if (
+                        str(identity["account_key"]) != expected.account_key
+                        or str(identity["db_uuid"]) != expected.db_uuid
+                        or str(identity["authority_id"]) != expected.authority_id
+                        or int(identity["identity_schema_version"])
+                        != expected.schema_version
+                    ):
+                        raise CoordinationIdentityError(
+                            "coordination DB identity does not match the "
+                            "certified account Runtime Authority "
+                            "(account_key / db_uuid / authority_id mismatch)"
+                        )
                 connection.commit()
             except Exception:
                 connection.rollback()
                 raise
             finally:
                 connection.close()
-        except CoordinationError:
+        except (CoordinationError, CoordinationIdentityError):
             raise
         except sqlite3.Error as exc:
             raise CoordinationError("unable to initialize coordination database") from exc
+
+    @classmethod
+    def create(
+        cls,
+        path: Path | str,
+        identity: CoordinationDbIdentity,
+        *,
+        timeout_seconds: float = 5.0,
+    ) -> "SQLiteExecutionCoordinator":
+        """Authorized bootstrap: create a fresh dedicated DB with identity.
+
+        Only callable from the Atomic Authority bootstrap path (under the
+        per-account authority lock).  Refuses to create over an existing
+        file, so a recreated/replaced DB can never silently inherit the
+        certified identity.
+        """
+        if not isinstance(identity, CoordinationDbIdentity):
+            raise TypeError("identity must be a CoordinationDbIdentity")
+        target = Path(path).expanduser().resolve(strict=False)
+        if target.exists():
+            raise CoordinationIdentityError(
+                "refusing to create a coordination DB over an existing file"
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(
+            str(target),
+            timeout=max(0.0, float(timeout_seconds)),
+            isolation_level=None,
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("BEGIN IMMEDIATE")
+            cls._ensure_schema(connection)
+            row = connection.execute(
+                "SELECT schema_version FROM coordination_meta LIMIT 1"
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO coordination_meta(schema_version) VALUES (?)",
+                    (_COORDINATION_SCHEMA_VERSION,),
+                )
+            connection.execute(
+                """
+                INSERT INTO coordination_identity(
+                    account_key, db_uuid, authority_id, identity_schema_version
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    identity.account_key,
+                    identity.db_uuid,
+                    identity.authority_id,
+                    identity.schema_version,
+                ),
+            )
+            connection.commit()
+        except sqlite3.Error as exc:
+            connection.rollback()
+            raise CoordinationError("unable to create coordination database") from exc
+        finally:
+            connection.close()
+        return cls(
+            path,
+            timeout_seconds=timeout_seconds,
+            expected_identity=identity,
+        )
 
     @staticmethod
     def _validate_identity(

@@ -183,6 +183,7 @@ def _config(
     strategy: str,
     coordination_path: Path | None,
     session_id: int | None = None,
+    authority_root: Path | None = None,
 ) -> MiniQmtRuntimeConfig:
     return MiniQmtRuntimeConfig(
         environment="simulation",
@@ -193,6 +194,7 @@ def _config(
         strategy_name=strategy,
         runtime_lock_mode="shared",
         coordination_path=coordination_path,
+        authority_root=authority_root,
         session_id=session_id,
         session_id_pool_start=210_000_000,
         session_id_pool_size=16,
@@ -229,7 +231,11 @@ def _connect(config: MiniQmtRuntimeConfig, factory, *, estimator=True):
     )
 
 
-def test_shared_mode_requires_durable_coordinator(tmp_path: Path):
+def test_shared_mode_without_explicit_path_uses_authority(tmp_path: Path):
+    # Core 0.4.1: shared mode without an explicit legacy coordination_path
+    # resolves the Account Runtime Authority (canonical per-account domain)
+    # instead of raising.  The strategy never selects the coordination DB
+    # path as proof of uniqueness.
     qmt_path = tmp_path / "userdata_mini"
     qmt_path.mkdir()
     binding = _binding(tmp_path, qmt_path)
@@ -239,9 +245,54 @@ def test_shared_mode_requires_durable_coordinator(tmp_path: Path):
         binding,
         strategy="a",
         coordination_path=None,
+        authority_root=tmp_path / "authority",
     )
-    with pytest.raises(RuntimeConfigurationError):
+    runtime = _connect(config, lambda path, sid: FakeTrader(path, sid))
+    try:
+        from qmt_execution_core.coordinated_session import CoordinatedExecutionSession
+
+        assert isinstance(runtime.session, CoordinatedExecutionSession)
+        # The coordinator is Authority-bound (identity verified).
+        assert runtime.session.coordinator.expected_identity is not None
+        assert list((tmp_path / "authority").glob("*.authority.json"))
+    finally:
+        runtime.close()
+
+
+def test_shared_mode_requires_durable_coordinator(tmp_path: Path):
+    # Fail closed when shared mode has no durable coordination domain at all:
+    # an injected coordinator is still required when both the legacy path and
+    # the Authority are unavailable (corrupt/missing Authority, no bootstrap).
+    qmt_path = tmp_path / "userdata_mini"
+    qmt_path.mkdir()
+    binding = _binding(tmp_path, qmt_path)
+    config = _config(
+        tmp_path,
+        qmt_path,
+        binding,
+        strategy="a",
+        coordination_path=None,
+        authority_root=tmp_path / "authority",
+    )
+    # A corrupt Authority must fail closed and must not bootstrap a fallback.
+    (tmp_path / "authority").mkdir(parents=True, exist_ok=True)
+    import json as _json
+
+    from qmt_execution_core.coordination import account_key_from_binding_identity
+    from qmt_execution_core.exceptions import RuntimeAuthorityError
+
+    binding_payload = _json.loads(binding.read_text(encoding="utf-8"))
+    account_key = account_key_from_binding_identity(
+        environment="simulation", account_type=2,
+        account_id_sha256=binding_payload["account_id_sha256"],
+    )
+    (tmp_path / "authority" / f"{account_key}.authority.json").write_text(
+        "{broken", encoding="utf-8"
+    )
+    with pytest.raises(RuntimeAuthorityError):
         _connect(config, lambda path, sid: FakeTrader(path, sid))
+    # No fallback coordination DB was created.
+    assert not list((tmp_path / "authority").glob("*.coordination.db"))
 
 
 def test_two_shared_runtimes_same_qmt_path_different_symbols_coexist(tmp_path: Path):
