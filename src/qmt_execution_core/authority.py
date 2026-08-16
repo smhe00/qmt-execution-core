@@ -32,7 +32,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .coordination import CoordinationDbIdentity, SQLiteExecutionCoordinator
+from .coordination import (
+    CoordinationDbIdentity,
+    SQLiteExecutionCoordinator,
+    account_key_from_binding_identity,
+)
 from .exceptions import RuntimeAuthorityError
 from .mutex import ExecutionMutex
 
@@ -44,18 +48,33 @@ _AUTHORITY_LOCK_TIMEOUT_SECONDS = 10.0
 def default_authority_root() -> Path:
     """Canonical host/user-level Core authority root (INV-AUTH-001).
 
-    Not per-strategy: every strategy process for the same account/user
-    resolves the same root.  Tests inject an explicit root.
+    NOT strategy-configurable and NOT derived from process-overridable
+    environment (no XDG_DATA_HOME / $HOME overrides): every strategy process
+    for the same OS user on the same host must derive the identical root so
+    the same account cannot be split across two Authority/DB domains.
+
+    * Windows: ``%LOCALAPPDATA%\\qmt-execution-core\\authority`` (the
+      OS-known per-user application-data location);
+    * POSIX: the OS user's home from the user database (``pwd``) +
+      ``.local/share/qmt-execution-core/authority``.
+
+    Tests inject an explicit root only through the low-level
+    :class:`AccountRuntimeAuthority` / ``MiniQmtRuntime.connect(authority=)``
+    API, never through production runtime configuration.
     """
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA")
         if base:
             return Path(base) / "qmt-execution-core" / "authority"
         return Path.home() / "AppData" / "Local" / "qmt-execution-core" / "authority"
-    xdg = os.environ.get("XDG_DATA_HOME")
-    if xdg:
-        return Path(xdg) / "qmt-execution-core" / "authority"
-    return Path.home() / ".local" / "share" / "qmt-execution-core" / "authority"
+    home = Path.home()
+    try:
+        import pwd
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        pass
+    return home / ".local" / "share" / "qmt-execution-core" / "authority"
 
 
 def _require_account_key(account_key: object) -> str:
@@ -208,6 +227,19 @@ class AccountRuntimeAuthority:
         env = _require_environment(environment)
         acct_type = _require_account_type(account_type)
         digest = _require_account_id_sha256(account_id_sha256)
+        # P2 hardening: the identity tuple must be internally consistent — an
+        # Authority record can never be created with a logically inconsistent
+        # account_key for the given environment/account_type/account_id.
+        derived_key = account_key_from_binding_identity(
+            environment=env,
+            account_type=acct_type,
+            account_id_sha256=digest,
+        )
+        if derived_key != key:
+            raise RuntimeAuthorityError(
+                "account_key is inconsistent with the given "
+                "environment/account_type/account_id identity tuple"
+            )
 
         lock = ExecutionMutex(
             self.lock_path(key),

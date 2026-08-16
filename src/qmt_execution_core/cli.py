@@ -5,6 +5,8 @@ import getpass
 import json
 from pathlib import Path
 
+from .authority import AccountRuntimeAuthority
+from .coordination import account_key_from_binding_identity
 from .miniqmt.binding import QmtAccountBinding
 from .miniqmt.runtime_gate import token_sha256
 from .verifier import verify_release_model
@@ -32,6 +34,21 @@ def main(argv: list[str] | None = None) -> int:
     binding.add_argument("--qmt-path", required=True)
     binding.add_argument("--output", required=True)
 
+    bootstrap = sub.add_parser(
+        "bootstrap-authority",
+        help=(
+            "explicit operator first-initialization of the account Runtime "
+            "Authority (Core 0.4.1): creates the dedicated coordination DB and "
+            "the canonical Authority under the per-account OS lock"
+        ),
+    )
+    bootstrap.add_argument("--binding", required=True)
+    bootstrap.add_argument(
+        "--authority-root",
+        default=None,
+        help="operator/test override of the canonical authority root",
+    )
+
     token = sub.add_parser(
         "hash-token",
         help="hash a runtime confirmation token without storing plaintext",
@@ -53,6 +70,34 @@ def main(argv: list[str] | None = None) -> int:
         )
         result.write(Path(args.output))
         print(f"binding written: {args.output}")
+        return 0
+
+    if args.command == "bootstrap-authority":
+        payload = json.loads(Path(args.binding).read_text(encoding="utf-8"))
+        environment = str(payload["environment"])
+        account_type = int(payload["account_type"])
+        account_id_sha256 = str(payload["account_id_sha256"])
+        account_key = account_key_from_binding_identity(
+            environment=environment,
+            account_type=account_type,
+            account_id_sha256=account_id_sha256,
+        )
+        # Explicit operator bootstrap uses the canonical host/user root unless
+        # an explicit operator/test override is supplied.
+        from .authority import default_authority_root
+
+        root = Path(args.authority_root) if args.authority_root else None
+        resolved = AccountRuntimeAuthority(
+            root if root is not None else default_authority_root()
+        ).resolve(
+            account_key=account_key,
+            environment=environment,
+            account_type=account_type,
+            account_id_sha256=account_id_sha256,
+            coordination_db_path=None,
+            bootstrap=True,
+        )
+        print(json.dumps(resolved.to_payload(), indent=2, sort_keys=True))
         return 0
 
     if args.command == "hash-token":

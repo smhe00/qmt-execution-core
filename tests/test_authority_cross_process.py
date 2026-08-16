@@ -14,7 +14,16 @@ from pathlib import Path
 import pytest
 
 from qmt_execution_core import AccountRuntimeAuthority
+from qmt_execution_core.coordination import account_key_from_binding_identity
 from qmt_execution_core.mutex import ConcurrentExecutionError, ExecutionMutex
+
+_SHA = "a" * 64
+
+
+def _account_key() -> str:
+    return account_key_from_binding_identity(
+        environment="simulation", account_type=2, account_id_sha256=_SHA,
+    )
 
 
 def _bootstrap_worker(root: str, account_key: str, queue) -> None:
@@ -24,7 +33,7 @@ def _bootstrap_worker(root: str, account_key: str, queue) -> None:
             account_key=account_key,
             environment="simulation",
             account_type=2,
-            account_id_sha256="a" * 64,
+            account_id_sha256=_SHA,
             coordination_db_path=None,
             bootstrap=True,
         )
@@ -52,7 +61,7 @@ def _lock_holder_worker(lock_path: str, hold_seconds: float, queue) -> None:
 class TestCrossProcessBootstrap:
     def test_scenario10_concurrent_bootstrap_converges_on_one_domain(self, tmp_path):
         root = str(tmp_path / "auth")
-        key = "k" * 64
+        key = _account_key()
         context = multiprocessing.get_context("spawn")
         queue = context.Queue()
         processes = [
@@ -76,7 +85,7 @@ class TestCrossProcessBootstrap:
         assert len(db_files) == 1
 
     def test_scenario12_lock_contention_blocks_then_releases(self, tmp_path):
-        lock_path = str(tmp_path / "auth" / f"{'k' * 64}.authority.lock")
+        lock_path = str(tmp_path / "auth" / f"{_account_key()}.authority.lock")
         Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
         context = multiprocessing.get_context("spawn")
         queue = context.Queue()

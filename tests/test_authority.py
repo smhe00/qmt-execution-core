@@ -25,10 +25,14 @@ from qmt_execution_core import (
     TradeState,
 )
 from qmt_execution_core.authority import default_authority_root
-from qmt_execution_core.coordination import SQLiteExecutionCoordinator
+from qmt_execution_core.coordination import (
+    SQLiteExecutionCoordinator,
+    account_key_from_binding_identity,
+)
 from qmt_execution_core.exceptions import (
     CoordinationIdentityError,
     RuntimeAuthorityError,
+    RuntimeConfigurationError,
 )
 from qmt_execution_core.miniqmt import (
     MiniQmtRuntime,
@@ -53,20 +57,13 @@ def _zero_estimator():
     return ConservativeCashRequirementEstimator(fee_rate=0.0, minimum_fee=0.0)
 
 
-def _key(root: Path, account_id: str = "A123") -> str:
-    """Replicate the runtime's account_key derivation for a fake account."""
+def _key(account_id_sha256: str = "a" * 64) -> str:
+    """Derive the canonical account_key for a fake account identity."""
     from qmt_execution_core.coordination import account_key_from_binding_identity
 
-    qmt = root / "qmt"
-    qmt.mkdir(parents=True, exist_ok=True)
-    binding = QmtAccountBinding.create(
-        environment="simulation", account_type=2, account_id=account_id,
-        qmt_path=qmt,
-    )
     return account_key_from_binding_identity(
-        environment=binding.environment,
-        account_type=binding.account_type,
-        account_id_sha256=binding.account_id_sha256,
+        environment="simulation", account_type=2,
+        account_id_sha256=account_id_sha256,
     )
 
 
@@ -96,7 +93,7 @@ class TestAuthorityResolveAndVerify:
     def test_scenario1_same_account_resolves_same_authority_file(self, tmp_path):
         root = tmp_path / "auth"
         authority = AccountRuntimeAuthority(root)
-        key = _key(tmp_path)
+        key = _key()
         first = authority.resolve(
             account_key=key, environment="simulation", account_type=2,
             account_id_sha256="a" * 64, bootstrap=True,
@@ -114,7 +111,7 @@ class TestAuthorityResolveAndVerify:
     def test_scenario2_same_certified_db_path_and_uuid(self, tmp_path):
         root = tmp_path / "auth"
         authority = AccountRuntimeAuthority(root)
-        key = _key(tmp_path)
+        key = _key()
         first = authority.resolve(
             account_key=key, environment="simulation", account_type=2,
             account_id_sha256="a" * 64, bootstrap=True,
@@ -134,8 +131,8 @@ class TestAuthorityResolveAndVerify:
     def test_scenario3_different_accounts_different_authority_and_db(self, tmp_path):
         root = tmp_path / "auth"
         authority = AccountRuntimeAuthority(root)
-        key_a = _key(tmp_path, "A1")
-        key_b = _key(tmp_path, "A2")
+        key_a = _key("a" * 64)
+        key_b = _key("b" * 64)
         auth_a = authority.resolve(
             account_key=key_a, environment="simulation", account_type=2,
             account_id_sha256="a" * 64, bootstrap=True,
@@ -153,8 +150,8 @@ class TestAuthorityResolveAndVerify:
     def test_scenario4_authority_account_key_mismatch_fails_closed(self, tmp_path):
         root = tmp_path / "auth"
         authority = AccountRuntimeAuthority(root)
-        key_a = _key(tmp_path, "A1")
-        key_b = _key(tmp_path, "A2")
+        key_a = _key("a" * 64)
+        key_b = _key("b" * 64)
         authority.resolve(
             account_key=key_a, environment="simulation", account_type=2,
             account_id_sha256="a" * 64, bootstrap=True,
@@ -170,7 +167,7 @@ class TestAuthorityResolveAndVerify:
     def test_scenario4b_authority_identity_mismatch_fails_closed(self, tmp_path):
         root = tmp_path / "auth"
         authority = AccountRuntimeAuthority(root)
-        key = _key(tmp_path)
+        key = _key()
         authority.resolve(
             account_key=key, environment="simulation", account_type=2,
             account_id_sha256="a" * 64, bootstrap=True,
@@ -190,7 +187,7 @@ class TestAuthorityResolveAndVerify:
     def test_scenario5_db_path_mismatch_fails_closed(self, tmp_path):
         root = tmp_path / "auth"
         authority = AccountRuntimeAuthority(root)
-        key = _key(tmp_path)
+        key = _key()
         authority.resolve(
             account_key=key, environment="simulation", account_type=2,
             account_id_sha256="a" * 64,
@@ -206,7 +203,7 @@ class TestAuthorityResolveAndVerify:
     def test_scenario6_db_uuid_mismatch_fails_closed(self, tmp_path):
         root = tmp_path / "auth"
         authority = AccountRuntimeAuthority(root)
-        key = _key(tmp_path)
+        key = _key()
         auth = authority.resolve(
             account_key=key, environment="simulation", account_type=2,
             account_id_sha256="a" * 64, bootstrap=True,
@@ -220,7 +217,7 @@ class TestAuthorityResolveAndVerify:
     def test_scenario7_db_account_key_mismatch_fails_closed(self, tmp_path):
         root = tmp_path / "auth"
         authority = AccountRuntimeAuthority(root)
-        key = _key(tmp_path)
+        key = _key()
         auth = authority.resolve(
             account_key=key, environment="simulation", account_type=2,
             account_id_sha256="a" * 64, bootstrap=True,
@@ -234,7 +231,7 @@ class TestAuthorityResolveAndVerify:
     def test_scenario8_db_authority_id_mismatch_fails_closed(self, tmp_path):
         root = tmp_path / "auth"
         authority = AccountRuntimeAuthority(root)
-        key = _key(tmp_path)
+        key = _key()
         auth = authority.resolve(
             account_key=key, environment="simulation", account_type=2,
             account_id_sha256="a" * 64, bootstrap=True,
@@ -248,7 +245,7 @@ class TestAuthorityResolveAndVerify:
     def test_scenario9_db_recreated_at_same_path_fails_closed(self, tmp_path):
         root = tmp_path / "auth"
         authority = AccountRuntimeAuthority(root)
-        key = _key(tmp_path)
+        key = _key()
         auth = authority.resolve(
             account_key=key, environment="simulation", account_type=2,
             account_id_sha256="a" * 64, bootstrap=True,
@@ -269,7 +266,7 @@ class TestAuthorityResolveAndVerify:
     def test_scenario11_corrupt_authority_fails_closed_no_fallback_db(self, tmp_path):
         root = tmp_path / "auth"
         authority = AccountRuntimeAuthority(root)
-        key = _key(tmp_path)
+        key = _key()
         authority.resolve(
             account_key=key, environment="simulation", account_type=2,
             account_id_sha256="a" * 64, bootstrap=True,
@@ -288,7 +285,7 @@ class TestAuthorityResolveAndVerify:
     def test_missing_authority_without_bootstrap_fails_closed(self, tmp_path):
         root = tmp_path / "auth"
         authority = AccountRuntimeAuthority(root)
-        key = _key(tmp_path)
+        key = _key()
         with pytest.raises(RuntimeAuthorityError):
             authority.resolve(
                 account_key=key, environment="simulation", account_type=2,
@@ -304,14 +301,15 @@ class TestRuntimeAuthorityIntegration:
     """Production shared runtime resolves through the Account Runtime Authority."""
 
     def _connect(self, tmp_path, *, account_id="A123", strategy_name="demo",
-                 authority_root=None):
+                 authority_root=None, bootstrap_authority=True):
         qmt_path = tmp_path / "userdata_mini"
         qmt_path.mkdir(parents=True, exist_ok=True)
         binding_path = tmp_path / "binding.json"
-        QmtAccountBinding.create(
+        binding = QmtAccountBinding.create(
             environment="simulation", account_type=2, account_id=account_id,
             qmt_path=qmt_path,
-        ).write(binding_path)
+        )
+        binding.write(binding_path)
         config = MiniQmtRuntimeConfig(
             environment="simulation",
             qmt_path=qmt_path,
@@ -321,7 +319,6 @@ class TestRuntimeAuthorityIntegration:
             strategy_name=strategy_name,
             query_delay_seconds=0,
             runtime_lock_mode="shared",
-            authority_root=authority_root or (tmp_path / "authority"),
         )
         holder = {}
 
@@ -330,6 +327,23 @@ class TestRuntimeAuthorityIntegration:
             holder["trader"] = trader
             return trader
 
+        # Test-only low-level injection: the runtime itself NEVER bootstraps.
+        root = Path(authority_root) if authority_root else (tmp_path / "authority")
+        store = AccountRuntimeAuthority(root)
+        if bootstrap_authority:
+            account_key = account_key_from_binding_identity(
+                environment=binding.environment,
+                account_type=binding.account_type,
+                account_id_sha256=binding.account_id_sha256,
+            )
+            store.resolve(
+                account_key=account_key,
+                environment=binding.environment,
+                account_type=binding.account_type,
+                account_id_sha256=binding.account_id_sha256,
+                coordination_db_path=None,
+                bootstrap=True,
+            )
         runtime = MiniQmtRuntime.connect(
             config,
             guard=AllowGuard(),
@@ -338,6 +352,7 @@ class TestRuntimeAuthorityIntegration:
             xtconstant=XtConstant,
             callback_base=CallbackBase,
             cash_estimator=_zero_estimator(),
+            authority=store,
         )
         return runtime, holder["trader"]
 
@@ -408,6 +423,7 @@ class TestRuntimeAuthorityIntegration:
             qmt_path=qmt,
         ).write(binding_b)
         root = tmp_path / "auth"
+        store = AccountRuntimeAuthority(root)
 
         def connect(binding_path, strategy, account_id):
             config = MiniQmtRuntimeConfig(
@@ -415,7 +431,7 @@ class TestRuntimeAuthorityIntegration:
                 journal_path=tmp_path / f"j-{strategy}.json",
                 lock_path=tmp_path / f"e-{strategy}.lock",
                 strategy_name=strategy, query_delay_seconds=0,
-                runtime_lock_mode="shared", authority_root=root,
+                runtime_lock_mode="shared",
             )
             holder = {}
 
@@ -425,10 +441,20 @@ class TestRuntimeAuthorityIntegration:
                 holder["trader"] = trader
                 return trader
 
+            payload = json.loads(binding_path.read_text(encoding="utf-8"))
+            store.resolve(
+                account_key=account_key_from_binding_identity(
+                    environment="simulation", account_type=2,
+                    account_id_sha256=payload["account_id_sha256"],
+                ),
+                environment="simulation", account_type=2,
+                account_id_sha256=payload["account_id_sha256"],
+                coordination_db_path=None, bootstrap=True,
+            )
             return MiniQmtRuntime.connect(
                 config, guard=AllowGuard(), trader_factory=factory,
                 stock_account_factory=StockAccount, xtconstant=XtConstant,
-                callback_base=CallbackBase,
+                callback_base=CallbackBase, authority=store,
             ), holder["trader"]
 
         runtime_a, _ = connect(binding_a, "demo-a", "A1")
@@ -458,6 +484,100 @@ class TestRuntimeAuthorityIntegration:
         with pytest.raises(CoordinationIdentityError):
             self._connect(tmp_path, strategy_name="demo2")
 
+    def test_normal_runtime_missing_authority_fails_closed_no_files(self, tmp_path):
+        # P1-2: normal runtime NEVER bootstraps; a missing Authority fails
+        # closed and creates no replacement files.
+        with pytest.raises(RuntimeConfigurationError):
+            self._connect(
+                tmp_path, strategy_name="demo", bootstrap_authority=False,
+            )
+        root = tmp_path / "authority"
+        assert not list(root.glob("*.authority.json"))
+        assert not list(root.glob("*.coordination.db"))
+
+    def test_deleting_authority_and_db_blocks_runtime_no_replacement(self, tmp_path):
+        # P1-2 regression: after BOTH the established Authority and its DB are
+        # deleted, a normal runtime restart must refuse to start and must not
+        # auto-create a new empty domain.
+        runtime, _ = self._connect(tmp_path, strategy_name="demo")
+        try:
+            root = tmp_path / "authority"
+            auth_file = next(root.glob("*.authority.json"))
+            payload = json.loads(auth_file.read_text(encoding="utf-8"))
+            db_path = Path(payload["coordination_db_path"])
+        finally:
+            runtime.close()
+        auth_file.unlink()
+        db_path.unlink()
+        with pytest.raises(RuntimeConfigurationError):
+            self._connect(
+                tmp_path, strategy_name="demo2", bootstrap_authority=False,
+            )
+        assert not list(root.glob("*.authority.json"))
+        assert not list(root.glob("*.coordination.db"))
+
+    def test_after_bootstrap_runtime_only_verifies_no_rewrite(self, tmp_path):
+        # P1-2: once bootstrapped, ordinary runtime resolution only VERIFIES;
+        # it never creates/replaces the Authority or the DB.
+        root = tmp_path / "authority"
+        runtime, _ = self._connect(tmp_path, strategy_name="demo")
+        try:
+            auth_file = next(root.glob("*.authority.json"))
+            before = auth_file.read_text(encoding="utf-8")
+            db_paths_before = set(root.glob("*.coordination.db"))
+        finally:
+            runtime.close()
+        runtime2, _ = self._connect(tmp_path, strategy_name="demo2")
+        try:
+            auth_file = next(root.glob("*.authority.json"))
+            assert auth_file.read_text(encoding="utf-8") == before
+            assert set(root.glob("*.coordination.db")) == db_paths_before
+        finally:
+            runtime2.close()
+
+    def test_runtime_config_schema_rejects_production_bypass_fields(self, tmp_path):
+        # P1-1 + P1-3: production runtime configuration must not expose
+        # authority_root or coordination_path as bypass routes.
+        qmt_path = tmp_path / "userdata_mini"
+        qmt_path.mkdir(parents=True, exist_ok=True)
+        binding_path = tmp_path / "binding.json"
+        QmtAccountBinding.create(
+            environment="simulation", account_type=2, account_id="A123",
+            qmt_path=qmt_path,
+        ).write(binding_path)
+        base = {
+            "schema_version": 1,
+            "environment": "simulation",
+            "qmt_path": str(qmt_path),
+            "binding_path": str(binding_path),
+            "journal_path": str(tmp_path / "j.json"),
+            "lock_path": str(tmp_path / "e.lock"),
+            "strategy_name": "demo",
+            "runtime_lock_mode": "shared",
+        }
+        for field in ("authority_root", "coordination_path"):
+            with pytest.raises(RuntimeConfigurationError):
+                payload = dict(base)
+                payload[field] = str(tmp_path / "bypass")
+                MiniQmtRuntimeConfig.from_json(_write_json(tmp_path, field, payload))
+
+    def test_account_key_inconsistent_identity_tuple_rejected(self, tmp_path):
+        # P2-1: account_key must equal the recomputed identity tuple.
+        store = AccountRuntimeAuthority(tmp_path / "auth")
+        with pytest.raises(RuntimeAuthorityError):
+            store.resolve(
+                account_key=_key(),
+                environment="simulation", account_type=2,
+                account_id_sha256="b" * 64, bootstrap=True,
+            )
+        assert not list((tmp_path / "auth").glob("*"))
+
+
+def _write_json(tmp_path, name, payload) -> Path:
+    path = tmp_path / f"{name}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
 
 class TestDefaultAuthorityRoot:
     def test_default_root_is_deterministic_and_host_level(self):
@@ -465,3 +585,4 @@ class TestDefaultAuthorityRoot:
         assert root.is_absolute()
         assert root.name == "authority"
         assert default_authority_root() == root
+

@@ -379,6 +379,14 @@ class SQLiteExecutionCoordinator:
                     raise CoordinationError("coordination schema version mismatch")
 
                 if self.expected_identity is not None:
+                    count = connection.execute(
+                        "SELECT COUNT(*) AS n FROM coordination_identity"
+                    ).fetchone()
+                    if count is None or int(count["n"]) != 1:
+                        raise CoordinationIdentityError(
+                            "coordination DB must contain exactly one "
+                            "authority identity row for the dedicated instance"
+                        )
                     identity = connection.execute(
                         """
                         SELECT account_key, db_uuid, authority_id,

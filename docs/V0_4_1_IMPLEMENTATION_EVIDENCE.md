@@ -172,3 +172,63 @@ specified.
   recovery, ExecutionFinality, symbol exclusivity, shared cash, session-id
   leasing, live gates) are unchanged; the release formal gate numbers are
   byte-identical to 0.4.0.
+
+## 7. Revision after independent audit (CHANGES_REQUIRED → fixed)
+
+The first candidate `d499254` was audited (docs/ARCHITECT_AUDIT_V0_4_1_RUNTIME_AUTHORITY.md)
+and required changes; this revision addresses all P1/P2 items:
+
+### P1-1 authority_root no longer strategy-configurable
+`MiniQmtRuntimeConfig.authority_root` was REMOVED from the production runtime
+configuration schema (`from_json` rejects it explicitly).  Production shared
+runtime derives ONE non-overridable host/user canonical root
+(`default_authority_root()`: `%LOCALAPPDATA%` on Windows, OS user-database
+home on POSIX — no process-overridable XDG/HOME).  Test isolation injects a
+root only through the low-level `MiniQmtRuntime.connect(authority=...)` /
+`AccountRuntimeAuthority` API, never through runtime JSON.
+
+### P1-2 normal runtime verifies only; bootstrap is explicit operator action
+`MiniQmtRuntime.connect()` shared mode now calls
+`AccountRuntimeAuthority.resolve(..., bootstrap=False)`.  A missing Authority
+during normal runtime FAILS CLOSED (`RuntimeConfigurationError`) and creates
+no replacement files.  First initialization is an explicit operator action:
+new CLI `qmt-execution-core bootstrap-authority --binding <file>`
+(optional `--authority-root` operator/test override).  Regressions prove:
+deleting both Authority + DB blocks the next runtime start with no
+auto-recreated domain; after bootstrap, ordinary runtime resolution only
+verifies (no rewrite).
+
+### P1-3 no production `coordination_path` bypass
+`MiniQmtRuntimeConfig.coordination_path` was REMOVED from the production
+shared-runtime configuration route (`from_json` rejects it explicitly).
+Explicit-path coordination remains available ONLY through the low-level
+injected `coordinator=` API (tests/legacy integration), never as a production
+runtime configuration field.  This is an explicit, audit-mandated release
+decision for 0.4.1 (the 0.4.0-only field is removed deliberately; documented,
+not silent).
+
+### P2 hardening
+- `AccountRuntimeAuthority.resolve()` recomputes
+  `account_key_from_binding_identity(environment, account_type,
+  account_id_sha256)` internally and rejects an inconsistent tuple;
+- Authority-bound DBs enforce EXACTLY ONE `coordination_identity` row
+  (COUNT check) in addition to the single-row identity match;
+- orphan-DB-after-crash (DB created, Authority replace not yet done) is
+  fail-closed: the orphan DB blocks adoption, the missing Authority blocks
+  normal runtime, and the operator bootstrap refuses to create over an
+  existing file — documented recovery: reconcile the orphan DB or remove it
+  explicitly before bootstrap.
+
+### Revised gates (all PASS)
+```text
+full pytest (3.12)         : 114 passed
+full pytest (3.9.13 wheel) : 114 passed
+compileall -q src tests    : 0
+wheel                      : qmt_execution_core-0.4.1-py3-none-any.whl
+clean-env install          : OK
+installed verify (3.12+3.9): PASS (release_formal_verification PASS,
+                             3-process 433,489 / 4,461,994 / 0 unchanged)
+execution_source_sha256    : daa9bafead2ad220ab11da7b40c07a00421c009c942e1b8a11dc8c542bba243c
+ast 3.9 parse              : NONE failed
+bootstrap-authority CLI    : smoke PASS (second run verifies, no rewrite)
+```
