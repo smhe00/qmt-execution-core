@@ -1,23 +1,8 @@
-# Generic Trading Execution State Machine
+# qmt-execution-core 0.4 状态机规格
 
-This document is the normative execution-model contract for `qmt-execution-core`.
-It is broker- and strategy-independent.
+本文是 `qmt-execution-core` 的 broker-neutral、strategy-neutral 执行状态机说明。正式产品边界与资源协调要求以 [v0.4 冻结规格](CORE_SPEC_V0_4_RESOURCE_COORDINATION.md) 为准。
 
-## 1. Scope
-
-The component answers only execution questions:
-
-```text
-Can this request safely be submitted now?
-What is the durable execution state?
-What broker observation is authoritative?
-How is an uncertain submit/cancel recovered?
-How is a crash resumed without duplicate orders?
-```
-
-It does **not** decide trading signals, target allocations, grid parameters, Core holdings, or portfolio strategy.
-
-## 2. States
+## 1. TradeState
 
 ```text
 IDLE
@@ -27,237 +12,257 @@ PRE_CHECK
 SUBMITTED
 ACCEPTED
 WORKING
+UNKNOWN
 PARTIALLY_FILLED
 PENDING_CANCEL
 CANCELLING
 CANCEL_REJECTED
-UNKNOWN
 FILLED
 CANCELLED
 REJECTED
 FAILED
 ```
 
-High-level lifecycle:
+状态机仍保持 one-active-execution-at-a-time。跨标的并发由多个独立 session/process 提供，而不是在单个状态机里管理多订单。
 
-```mermaid
-stateDiagram-v2
-    [*] --> IDLE
-    IDLE --> WAIT_TRIGGER: SESSION_READY
-    WAIT_TRIGGER --> TRIGGER: TRIGGERED
-    TRIGGER --> PRE_CHECK: BEGIN_PRECHECK
-    PRE_CHECK --> PRE_CHECK: PRECHECK_VERIFIED
-    PRE_CHECK --> SUBMITTED: INTENT_PERSISTED
-    PRE_CHECK --> REJECTED: PRECHECK_REJECTED
+---
 
-    SUBMITTED --> ACCEPTED: SUBMIT_ACCEPTED
-    SUBMITTED --> REJECTED: SUBMIT_REJECTED
-    SUBMITTED --> UNKNOWN: SUBMIT_AMBIGUOUS
+## 2. 关键执行路径
 
-    ACCEPTED --> WORKING: ORDER_WORKING
-    ACCEPTED --> PARTIALLY_FILLED: ORDER_PARTIAL
-    ACCEPTED --> FILLED: ORDER_FILLED
-    ACCEPTED --> REJECTED: ORDER_REJECTED
-
-    WORKING --> PARTIALLY_FILLED: ORDER_PARTIAL
-    WORKING --> FILLED: ORDER_FILLED
-    WORKING --> PENDING_CANCEL: CANCEL_REQUESTED
-    WORKING --> UNKNOWN: QUERY_AMBIGUOUS
-
-    PARTIALLY_FILLED --> FILLED: ORDER_FILLED
-    PARTIALLY_FILLED --> PENDING_CANCEL: CANCEL_REQUESTED
-    PARTIALLY_FILLED --> UNKNOWN: QUERY_AMBIGUOUS
-
-    PENDING_CANCEL --> CANCELLING: CANCEL_SENT
-    PENDING_CANCEL --> CANCEL_REJECTED: CANCEL_REQUEST_REJECTED
-    PENDING_CANCEL --> CANCELLED: CANCEL_CONFIRMED
-    PENDING_CANCEL --> FILLED: ORDER_FILLED
-
-    CANCELLING --> CANCELLING: CANCEL_STILL_PENDING
-    CANCELLING --> CANCELLED: CANCEL_CONFIRMED
-    CANCELLING --> FILLED: ORDER_FILLED
-    CANCELLING --> UNKNOWN: QUERY_AMBIGUOUS
-
-    CANCEL_REJECTED --> WORKING: RECOVERY_WORKING
-    CANCEL_REJECTED --> PARTIALLY_FILLED: RECOVERY_PARTIAL
-    CANCEL_REJECTED --> CANCELLING: RECOVERY_CANCELLING
-    CANCEL_REJECTED --> FILLED: RECOVERY_FILLED
-    CANCEL_REJECTED --> CANCELLED: RECOVERY_CANCELLED
-    CANCEL_REJECTED --> REJECTED: RECOVERY_REJECTED
-    CANCEL_REJECTED --> UNKNOWN: QUERY_AMBIGUOUS
-
-    UNKNOWN --> ACCEPTED: RECOVERY_ACCEPTED
-    UNKNOWN --> WORKING: RECOVERY_WORKING
-    UNKNOWN --> PARTIALLY_FILLED: RECOVERY_PARTIAL
-    UNKNOWN --> CANCELLING: RECOVERY_CANCELLING
-    UNKNOWN --> FILLED: RECOVERY_FILLED
-    UNKNOWN --> CANCELLED: RECOVERY_CANCELLED
-    UNKNOWN --> REJECTED: RECOVERY_REJECTED
-    UNKNOWN --> FAILED: RECOVERY_FAILED
-
-    FILLED --> WAIT_TRIGGER: NEXT_CYCLE
-    CANCELLED --> WAIT_TRIGGER: NEXT_CYCLE
-    REJECTED --> WAIT_TRIGGER: NEXT_CYCLE
-```
-
-The Python `TRANSITIONS` table is the exact executable source of truth if this diagram and code ever differ.
-
-## 3. SafetyFacts
-
-The abstract machine carries facts rather than treating state names as proof:
-
-```python
-SafetyFacts(
-    environment_verified=False,
-    account_verified=False,
-    broker_snapshot_verified=False,
-    position_verified=False,
-    cash_verified=False,
-    quote_verified=False,
-    intent_persisted=False,
-    reservation_persisted=False,
-    unresolved_order=False,
-    terminal_order_confirmed=False,
-    submitted_once=False,
-    cancel_intent_persisted=False,
-)
-```
-
-`SESSION_READY` cannot self-certify readiness; it requires a `SessionEvidence` object.
-`PRECHECK_VERIFIED` cannot self-certify cash/position/quote state; it requires a complete `PrecheckEvidence` object supplied by the execution guard.
-
-## 4. Core invariants
-
-### INV-001 — verified session
-
-Every broker-side execution path must retain verified environment and account facts.
-
-### INV-002 — fresh precheck before durable intent
-
-`INTENT_PERSISTED` is only legal after the current cycle proves:
+正常提交：
 
 ```text
+IDLE
+ -> WAIT_TRIGGER
+ -> TRIGGER
+ -> PRE_CHECK
+ -> SUBMITTED
+ -> ACCEPTED
+ -> WORKING / PARTIALLY_FILLED
+ -> FILLED / CANCELLED / REJECTED
+```
+
+协调模式下，`SUBMITTED` 表示 Core durable intent 已经写入；实际 broker side effect 之前仍有两个同步阶段：
+
+```text
+Core Durable Intent
+      |
+      v
+SUBMITTED
+      |
+      +-- shared coordination
+      |      - symbol claim
+      |      - BUY cash reservation
+      |
+      +-- project before_broker_submit sidecar
+      |
+      v
+BrokerPort.place_order()
+```
+
+---
+
+## 3. Pre-broker 结果
+
+### PRE_BROKER_REJECTED
+
+用于 Core/shared coordination 的**正常 fail-closed 本地拒绝**，例如：
+
+- 同 `(account_key, symbol)` 已被另一个 unresolved execution 占用；
+- conservative BUY cash 不足；
+- coordinated BUY 缺少必须的 estimator。
+
+路径：
+
+```text
+SUBMITTED
+ -> PRE_BROKER_REJECTED
+ -> REJECTED
+```
+
+并且：
+
+```text
+broker_invoked = false
+submitted_once = false
+unresolved_order = false
+```
+
+### PRE_BROKER_ABORTED
+
+用于同步 pre-broker hook 的异常失败，例如 project sidecar 持久化失败：
+
+```text
+SUBMITTED
+ -> PRE_BROKER_ABORTED
+ -> FAILED
+```
+
+但它与 broker ambiguity 不同：
+
+```text
+submitted_once = false
+unresolved_order = false
+terminal_order_confirmed = true
+ExecutionFinality = RESOLVED
+```
+
+因此 `FAILED` 不能单独用于判断资源是否可释放。
+
+---
+
+## 4. Broker submit 结果
+
+```text
+positive broker order id
+ -> SUBMIT_ACCEPTED
+ -> ACCEPTED
+ -> authoritative poll
+
+broker definitive rejection
+ -> SUBMIT_REJECTED
+ -> REJECTED
+
+ambiguous exception / ambiguous result
+ -> SUBMIT_AMBIGUOUS
+ -> UNKNOWN
+```
+
+`UNKNOWN` 永远不能触发 blind resend。
+
+---
+
+## 5. UNKNOWN / Recovery
+
+`UNKNOWN` 是 recoverable state，不是“没有订单”。
+
+允许通过权威 broker query/reconciliation 恢复到：
+
+```text
+ACCEPTED
+WORKING
+PARTIALLY_FILLED
+CANCELLING
+FILLED
+CANCELLED
+REJECTED
+```
+
+如果恢复仍无法确定 broker reality：
+
+```text
+UNKNOWN
+ -> RECOVERY_FAILED
+ -> FAILED
+```
+
+此时 `unresolved_order=True`，所以：
+
+```text
+ExecutionFinality = QUARANTINED
+```
+
+同标 symbol claim 必须继续保持。
+
+---
+
+## 6. Cancel 语义
+
+撤单请求不是最终取消：
+
+```text
+WORKING / PARTIALLY_FILLED
+ -> CANCEL_REQUESTED
+ -> PENDING_CANCEL
+ -> CANCEL_SENT
+ -> CANCELLING
+ -> authoritative broker query
+```
+
+撤单 API 返回失败：
+
+```text
+PENDING_CANCEL
+ -> CANCEL_REQUEST_REJECTED
+ -> CANCEL_REJECTED
+ -> mandatory query/recovery
+```
+
+`CANCEL_REJECTED` 仍是 recoverable state。
+
+撤单过程中如果订单成交：
+
+```text
+CANCELLING -> ORDER_FILLED -> FILLED
+```
+
+成交事实优先。
+
+---
+
+## 7. ExecutionFinality
+
+0.4 在 `TradeState + SafetyFacts` 之上推导：
+
+```text
+OPEN
+RESOLVED
+QUARANTINED
+```
+
+典型语义：
+
+```text
+WORKING / PARTIALLY_FILLED / UNKNOWN / CANCEL_REJECTED -> OPEN
+FILLED / CANCELLED / REJECTED                         -> RESOLVED
+FAILED + unresolved_order=True                        -> QUARANTINED
+FAILED + unresolved_order=False                       -> RESOLVED
+```
+
+资源协调层只有在 `RESOLVED` 时才释放 `(account_key, symbol)` claim。
+
+---
+
+## 8. SafetyFacts 关键事实
+
+状态机持续追踪：
+
+```text
+environment_verified
+account_verified
 broker_snapshot_verified
 position_verified
 cash_verified
 quote_verified
+intent_persisted
+reservation_persisted
+submitted_once
+unresolved_order
+terminal_order_confirmed
+cancel_intent_persisted
 ```
 
-This guard prevents a later cycle from reusing stale precheck facts.
+重要不变量：
 
-### INV-003 — durable intent/reservation before possible submit
+- broker submit 必须有 durable intent/reservation evidence；
+- unresolved order 不得回到新订单路径；
+- cancel path 必须先有 durable cancel intent；
+- `UNKNOWN` 必须保持 unresolved evidence；
+- successful terminal state 必须有 broker confirmation；
+- pre-broker local reject/abort 不得伪造 `submitted_once=True`。
 
-```text
-submitted_once == true
-=> intent_persisted == true
-AND reservation_persisted == true
-```
+---
 
-### INV-004 — unresolved order cannot enter a new-order path
+## 9. Formal Verification
 
-```text
-unresolved_order == true
-=> state not in WAIT_TRIGGER / TRIGGER / PRE_CHECK
-```
+`verify_state_machine()` 对显式状态空间做 fixed-point exhaustive reachability，检查：
 
-### INV-005 — cancel intent precedes cancel side effect
+- 所有声明 state 可达；
+- 所有声明 transition 可达；
+- 每个 reachable non-terminal state 有 terminal path；
+- 没有 reachable invariant violation；
+- UNKNOWN 没有 blind resend/new-order edge；
+- v0.4 finality refinement 一致；
+- protected execution sources 完整并参与 SHA-256 binding。
 
-`PENDING_CANCEL`, `CANCELLING`, and `CANCEL_REJECTED` require `cancel_intent_persisted`.
-
-### INV-006 — successful terminal state requires broker confirmation
-
-`FILLED` and `CANCELLED` require:
-
-```text
-terminal_order_confirmed == true
-unresolved_order == false
-```
-
-### INV-007 — UNKNOWN has no blind retry path
-
-`UNKNOWN` contains only query/recovery outcomes. It cannot directly submit another intent or begin a new execution cycle.
-
-## 5. Durable ordering
-
-Submit order:
-
-```text
-verify session/precheck
-→ persist intent + reservation evidence
-→ journal INTENT_PERSISTED transition
-→ broker place_order side effect
-→ persist broker order id when known
-→ query/reconcile broker state
-```
-
-Cancel order:
-
-```text
-persist cancel intent
-→ journal CANCEL_REQUESTED transition
-→ broker cancel side effect
-→ authoritative re-query
-→ state-aware terminal/nonterminal transition
-```
-
-`cancel()` acknowledgement is never proof that the order was cancelled.
-
-## 6. UNKNOWN recovery
-
-If submit outcome is ambiguous and no broker order id is durable:
-
-```text
-query all managed broker orders
-→ match exact durable identity
-   order_remark + symbol + side + qty
-→ exactly one match required
-```
-
-Zero matches and multiple matches are both ambiguous. Zero is **not** permission to resend because an order may have reached the broker but not yet be visible.
-
-If a durable broker order id exists, recovery queries that exact order id.
-
-## 7. Restart recovery
-
-`ExecutionSession.open()` acquires the cross-process mutex **before any journal I/O**.
-A nonterminal in-flight journal is moved to `UNKNOWN` through `RESTART_RECOVERY`, then broker-authoritative reconciliation determines the next state.
-
-An interrupted pre-submit `TRIGGER/PRE_CHECK` run fails closed rather than silently resetting.
-
-## 8. Mutex ownership
-
-The session owns `ExecutionMutex` for its entire open lifetime.
-`close()` releases the lock and irreversibly closes that session object. Public execution methods also verify current mutex ownership, so loss of lock ownership cannot leave an order-capable object.
-
-## 9. Formal verification
-
-`verify_state_machine()` performs exhaustive explicit-state reachability to a fixed point across `TradeState × SafetyFacts` states reachable under the guarded transitions.
-It verifies:
-
-- every declared state is reachable;
-- every declared transition is reachable in at least one valid fact context;
-- every reachable state satisfies invariants;
-- every reachable nonterminal state has a path to a terminal state;
-- `UNKNOWN` contains no new-order/blind-retry transitions.
-
-It also emits:
-
-```text
-transition_spec_sha256
-execution_source_sha256
-```
-
-The source manifest is fail-closed: a missing protected execution source raises verification failure.
-
-## 10. Verification boundary
-
-Formal model verification proves the abstract model, not arbitrary Python runtime behavior.
-Therefore every broker adapter must also provide refinement tests proving:
-
-```text
-broker/API observation
-→ normalized broker state
-→ correct abstract event for current TradeState
-```
-
-A release gate should require both model verification and runtime refinement tests.
+任何 state/event 变化都必须同步更新 verifier 与 refinement tests。
