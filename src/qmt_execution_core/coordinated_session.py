@@ -16,6 +16,7 @@ from .exceptions import (
     BrokerSubmissionAmbiguous,
     BrokerSubmissionRejected,
     CoordinationError,
+    SymbolClaimConflict,
 )
 from .finality import ExecutionFinality, execution_finality
 from .ports import AccountResourcePort, BrokerPort, ExecutionGuard
@@ -25,7 +26,7 @@ from .session import ExecutionSession
 class _CoordinatedBrokerPort:
     """Broker wrapper that coordinates shared resources before submit.
 
-    The wrapped ExecutionSession still owns the reliable order lifecycle.  This
+    The wrapped ExecutionSession still owns the reliable order lifecycle. This
     wrapper only inserts the v0.4 shared-account critical section immediately
     before the real BrokerPort.place_order side effect.
     """
@@ -86,7 +87,7 @@ class _CoordinatedBrokerPort:
         try:
             return self.raw_broker.place_order(request)
         except BrokerSubmissionRejected:
-            # Broker/API definitively says no order exists.  Releasing the
+            # Broker/API definitively says no order exists. Releasing the
             # local claim/reservation is safe; a later order still refreshes
             # broker cash rather than adding this reservation back locally.
             self.coordinator.update_finality(
@@ -101,7 +102,7 @@ class _CoordinatedBrokerPort:
             raise
         except Exception as exc:
             # A generic broker implementation violated the BrokerPort error
-            # contract.  Treat it as ambiguous, never as permission to release
+            # contract. Treat it as ambiguous, never as permission to release
             # resources or blindly resend.
             raise BrokerSubmissionAmbiguous(
                 "coordinated broker submit raised unexpectedly; outcome unknown"
@@ -128,7 +129,7 @@ class _CoordinatedBrokerPort:
 class CoordinatedExecutionSession(ExecutionSession):
     """ExecutionSession with durable per-symbol and shared-cash coordination.
 
-    It remains one-active-execution-at-a-time.  Cross-symbol concurrency comes
+    It remains one-active-execution-at-a-time. Cross-symbol concurrency comes
     from multiple independent instances/processes sharing the same coordinator.
     """
 
@@ -240,12 +241,24 @@ class CoordinatedExecutionSession(ExecutionSession):
         finality = execution_finality(self.machine)
 
         if finality is ExecutionFinality.RESOLVED:
-            self.coordinator.update_finality(
-                account_key=self.account_key,
-                execution_id=self.execution_id,
-                request=request,
-                finality=finality,
-            )
+            # A submit may have been rejected before this execution ever
+            # acquired the symbol (for example another process already owns
+            # it). Never update/delete another execution's claim.
+            try:
+                owns_claim = self.coordinator.has_claim(
+                    account_key=self.account_key,
+                    execution_id=self.execution_id,
+                    request=request,
+                )
+            except SymbolClaimConflict:
+                return snapshot
+            if owns_claim:
+                self.coordinator.update_finality(
+                    account_key=self.account_key,
+                    execution_id=self.execution_id,
+                    request=request,
+                    finality=finality,
+                )
             return snapshot
 
         if self.coordinator.has_claim(
@@ -262,7 +275,7 @@ class CoordinatedExecutionSession(ExecutionSession):
             return snapshot
 
         # Recovery path: if the coordination DB was recreated or the durable
-        # claim is otherwise missing, re-establish it conservatively.  Existing
+        # claim is otherwise missing, re-establish it conservatively. Existing
         # broker orders do not re-check available cash because that cash may
         # already be frozen/reflected by the broker.
         self.coordinator.restore(
