@@ -15,3 +15,5 @@ journals/
 *.db
 *.sqlite
 *.sqlite3
+*.whl
+%temp%/

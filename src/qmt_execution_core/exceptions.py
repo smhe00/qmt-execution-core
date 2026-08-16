@@ -60,3 +60,21 @@ class CashReservationRejected(CoordinationError):
 
 class SessionIdUnavailable(RuntimeConfigurationError):
     """No MiniQMT session id could be leased from the configured bounded pool."""
+
+
+class RuntimeAuthorityError(ExecutionCoreError):
+    """Account Runtime Authority is missing, corrupt, or identity-mismatched.
+
+    Core 0.4.1: shared execution for one account is allowed only after the
+    canonical per-account Runtime Authority verifies the dedicated
+    coordination DB instance (INV-AUTH-001 / INV-AUTH-002).
+    """
+
+
+class CoordinationIdentityError(CoordinationError):
+    """Coordination DB identity metadata does not match the certified authority.
+
+    Covers: missing identity metadata (legacy/0.4.0 DB), account_key
+    mismatch, db_uuid mismatch (recreated DB at the same path), authority_id
+    mismatch, and missing certified DB file. Always fail closed.
+    """

@@ -1,147 +1,101 @@
-# Implementation Task — qmt-execution-core 0.4.1 Runtime Authority
+# Implementation Task — qmt-execution-core Runtime Authority Hardening
 
 ## Status
 
-AUTHORIZED FOR IMPLEMENTATION
+**CHANGES_REQUIRED** after independent audit of candidate:
+
+```text
+d4992543b7aa2496b2ba3fb7cd51b5cc74192a00
+```
+
+Authoritative audit:
+
+```text
+docs/ARCHITECT_AUDIT_V0_4_1_RUNTIME_AUTHORITY.md
+```
 
 ## Owner
 
-DSH / implementation agent. All implementation evidence remains self-certified until independent architect audit.
-
-## Baseline
-
-```text
-qmt-execution-core 0.4.0
-acf20d9fe5cf2aede3cc0ad0e8936ecb0c5b2692
-```
-
-Authoritative delta spec:
-
-```text
-docs/CORE_0_4_1_RUNTIME_AUTHORITY_SPEC.md
-```
+DSH / implementation agent.
 
 No real or simulation QMT order/cancel is authorized.
 
-## Objective
+## Accepted baseline
 
-Close the remaining split-brain configuration hole in Core 0.4.0:
+The candidate's existing Runtime Authority model, DB UUID identity, cross-process Authority lock/bootstrap machinery, Core 0.4 execution semantics and reported 108-test suite are retained as the regression baseline. Do not discard them.
 
-```text
-same account + two different configured coordination_path
-```
+## Required P1 fixes
 
-must no longer be a possible production shared-runtime configuration.
+### P1-1 Make the production Authority root actually unique
 
-Implement an account-scoped Runtime Authority that certifies exactly one dedicated coordination DB instance by canonical path + persistent DB UUID.
+`MiniQmtRuntimeConfig.authority_root` must not remain a strategy-selectable production/JSON option. Otherwise the same account can use two roots and create two independent Authority/DB domains.
 
-## Required implementation
+Production shared runtime must derive one canonical host/user Authority root. Test isolation may inject another root only through a clearly separated test/low-level path that cannot be mistaken for production runtime configuration.
 
-### P1-1 Account Runtime Authority model
+Add a negative test proving two production runtimes for the same account cannot select two different Authority roots.
 
-Add a generic Core model/store for:
+### P1-2 Separate explicit bootstrap from normal runtime start
 
-```text
-schema_version
-authority_id
-account_key
-environment
-account_type
-account_id_sha256
-coordination_db_path
-coordination_db_uuid
-```
+Normal production `MiniQmtRuntime.connect()` must **not** call `resolve(..., bootstrap=True)`.
 
-Authority path must be derived from `account_key` under a canonical host/user Core authority root. Production strategy code must not choose the Authority filename.
-
-### P1-2 Dedicated DB identity metadata
-
-Authority-bound coordination DB must persist:
+Required lifecycle:
 
 ```text
-account_key
-db_uuid
-authority_id
-schema_version
+explicit operator bootstrap
+  -> create/lock/certify Authority + dedicated DB once
+
+normal strategy runtime
+  -> resolve(..., bootstrap=False)
+  -> verify Authority + DB identity only
 ```
 
-The UUID is generated once for a DB instance and remains stable across normal content changes.
+If Authority is missing during normal runtime, fail closed.
 
-### P1-3 Atomic bootstrap
-
-Provide a bootstrap path protected by an OS-backed per-account authority lock. Two independent processes racing first initialization must converge on one Authority + one DB UUID/domain.
-
-Do not silently adopt/rewrite a mismatched existing Authority or DB.
-
-### P1-4 Production shared-runtime resolution
-
-Production shared runtime flow must be:
+Required regression:
 
 ```text
-actual account binding
-→ account_key
-→ canonical authority path
-→ authority verification
-→ certified DB path open
-→ DB identity verification
-→ coordinator construction
+established Authority + DB
+-> delete both
+-> normal runtime start
+-> FAIL CLOSED
+-> no new Authority
+-> no new DB
 ```
 
-Do not trust a strategy-supplied arbitrary `coordination_path` as proof of uniqueness.
+Provide a dedicated explicit bootstrap API/CLI or equivalent operator provisioning entrypoint.
 
-Legacy explicit-path low-level API may remain for compatibility/tests, but it must not be the production uniqueness-guaranteed path.
+### P1-3 Remove the production `coordination_path` bypass
 
-### P1-5 Fail-closed mismatch matrix
+`MiniQmtRuntimeConfig.coordination_path` must not remain a normal production shared-runtime path that directly constructs `SQLiteExecutionCoordinator` and bypasses Authority verification.
 
-At minimum reject:
+Low-level explicit-path coordinator support may remain for isolated tests/compatibility, but production `MiniQmtRuntime` shared execution must resolve through Runtime Authority.
 
-- account_key mismatch;
-- environment/account identity mismatch;
-- canonical DB path mismatch;
-- DB UUID mismatch;
-- DB account_key mismatch;
-- DB authority_id mismatch;
-- corrupted/truncated authority file;
-- DB recreated at same path with a new UUID;
-- missing authority during normal non-bootstrap runtime;
-- conflicting concurrent bootstrap.
+If removing/changing this public production configuration is source-incompatible, stop and explicitly decide whether the safe release is `0.5.0` rather than silently retaining the unsafe bypass under `0.4.1`.
 
-### P1-6 Preserve Core 0.4 semantics
+## P2 hardening
 
-Do not weaken:
+- Recompute `account_key_from_binding_identity(environment, account_type, account_id_sha256)` inside Authority resolution and require it equals the supplied account_key.
+- Prefer enforcing exactly one Authority identity row per dedicated coordination DB instead of `LIMIT 1` over a potentially multi-row table.
+- Document the fail-closed orphan-DB case if a crash occurs after DB creation but before Authority atomic replace.
 
-- durable intent ordering;
-- UNKNOWN/query-only recovery;
-- ExecutionFinality;
-- `(account_key, symbol)` unresolved exclusivity;
-- shared BUY cash reservation;
-- bounded session-id leasing;
-- live double gate/account binding;
-- callback isolation;
-- Python >=3.9;
-- formal verifier/refinement gate.
+## Required verification after fixes
 
-## Formal and test requirements
-
-Run and record:
-
-```text
-full pytest
-compileall
-wheel build + clean install
-installed qmt-execution-core verify
-Python 3.9 / 3.11 / 3.12 CI
-Windows safety probes
-```
-
-Add cross-process tests for Authority bootstrap and verification.
-
-The existing three-process state-space proof need not model filesystem bytes, but the release gate must still pass unchanged after Authority authentication is inserted before coordinator use. Add runtime/refinement tests proving no broker side effect can occur before Authority + DB identity verification succeeds.
+- full pytest;
+- compileall;
+- Python 3.9 / 3.11 / 3.12 CI;
+- Windows cross-process Authority bootstrap/lock tests;
+- wheel build + clean install;
+- installed `qmt-execution-core verify`;
+- existing three-process formal state-space proof unchanged PASS;
+- production same-account/two-root split-brain attempt rejected;
+- missing Authority on normal runtime rejected;
+- deleting both Authority+DB does not auto-create replacements;
+- production shared runtime cannot select arbitrary `coordination_path`;
+- explicit bootstrap race converges to one Authority/DB UUID;
+- zero real or simulation QMT order/cancel.
 
 ## Release discipline
 
-Implement on a separate branch/PR. Do not merge until independent architecture/code audit PASS.
+Do not merge candidate `d4992543...`.
 
-Expected release: `0.4.1` unless implementation discovers a source/API incompatibility that requires a minor-version bump; if so stop and escalate rather than silently relabel.
-
-After reviewed Core merge, TGrid must pin the exact reviewed merge SHA and remove production `coordination_path` / Gate-6 `--coordination-db` selection in favor of Account Runtime Authority resolution.
+Return a new exact branch head for independent architecture/code audit. Only after audit PASS may a PR be merged and TGrid updated to the reviewed merge SHA.

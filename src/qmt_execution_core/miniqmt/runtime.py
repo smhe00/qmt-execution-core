@@ -7,9 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from ..authority import AccountRuntimeAuthority, default_authority_root
 from ..coordinated_session import CoordinatedExecutionSession
 from ..coordination import (
     CashRequirementEstimator,
+    CoordinationDbIdentity,
     ExecutionCoordinator,
     SQLiteExecutionCoordinator,
     account_key_from_binding_identity,
@@ -20,6 +22,7 @@ from ..mutex import ExecutionMutex
 from ..exceptions import (
     EventQueueUnhealthy,
     RecoveryAmbiguous,
+    RuntimeAuthorityError,
     RuntimeConfigurationError,
     SessionIdUnavailable,
 )
@@ -63,7 +66,6 @@ _RUNTIME_OPTIONAL_FIELDS = {
     "query_delay_seconds",
     "event_queue_size",
     "runtime_lock_mode",
-    "coordination_path",
     "session_id_pool_start",
     "session_id_pool_size",
     "session_id_attempts",
@@ -86,7 +88,6 @@ class MiniQmtRuntimeConfig:
     query_delay_seconds: float = 0.15
     event_queue_size: int = 1024
     runtime_lock_mode: str = "exclusive"
-    coordination_path: Path | str | None = None
     session_id_pool_start: int = 100_000_000
     session_id_pool_size: int = 1_000
     session_id_attempts: int = 32
@@ -97,12 +98,6 @@ class MiniQmtRuntimeConfig:
         for name in ("qmt_path", "binding_path", "journal_path", "lock_path"):
             value = Path(getattr(self, name)).expanduser()
             object.__setattr__(self, name, value)
-        if self.coordination_path is not None:
-            object.__setattr__(
-                self,
-                "coordination_path",
-                Path(self.coordination_path).expanduser(),
-            )
         if type(self.strategy_name) is not str or not self.strategy_name:
             raise RuntimeConfigurationError("strategy_name must be non-empty")
         if type(self.live_trading_enabled) is not bool:
@@ -149,6 +144,22 @@ class MiniQmtRuntimeConfig:
             raise RuntimeConfigurationError("runtime config is unreadable") from exc
         if not isinstance(payload, dict):
             raise RuntimeConfigurationError("runtime config must be a JSON object")
+        # Core 0.4.1: production shared-runtime configuration must not route
+        # around the Account Runtime Authority.  Explicit, precise rejection
+        # BEFORE the generic strict-schema message.
+        if payload.get("coordination_path") is not None:
+            raise RuntimeConfigurationError(
+                "coordination_path is not a production shared-runtime "
+                "configuration field (Core 0.4.1); shared mode resolves the "
+                "account Runtime Authority, and explicit-path coordination is "
+                "available only via the low-level injected coordinator API"
+            )
+        if payload.get("authority_root") is not None:
+            raise RuntimeConfigurationError(
+                "authority_root is not a production runtime configuration "
+                "field (Core 0.4.1); the canonical account Runtime Authority "
+                "root is host/user-derived and not strategy-selectable"
+            )
         keys = set(payload)
         if not _RUNTIME_REQUIRED_FIELDS <= keys or not keys <= _RUNTIME_CONFIG_FIELDS:
             raise RuntimeConfigurationError("runtime config fields do not match strict schema")
@@ -160,11 +171,6 @@ class MiniQmtRuntimeConfig:
             if not value.is_absolute():
                 value = base / value
             payload[name] = value
-        if payload.get("coordination_path") is not None:
-            value = Path(str(payload["coordination_path"])).expanduser()
-            if not value.is_absolute():
-                value = base / value
-            payload["coordination_path"] = value
         return cls(**payload)
 
 
@@ -178,8 +184,12 @@ class MiniQmtRuntime:
     """Production-shaped reusable MiniQMT runtime.
 
     ``exclusive`` mode preserves the v0.3 qmt-path-wide safety mutex.
-    ``shared`` mode replaces that coarse exclusion with durable per-symbol/
-    shared-cash coordination plus an OS-lock-backed bounded MiniQMT session id.
+    ``shared`` mode (Core 0.4.1) resolves the canonical per-account Account
+    Runtime Authority (verify-only; explicit operator bootstrap) and certifies
+    the dedicated coordination DB before any broker side effect, plus an
+    OS-lock-backed bounded MiniQMT session id.  The authority root is
+    host/user-derived and is NOT strategy-configurable; low-level/test
+    explicit coordination is available only via the injected ``coordinator``.
     """
 
     def __init__(
@@ -232,6 +242,7 @@ class MiniQmtRuntime:
         before_broker_cancel: Callable[[int], None] | None = None,
         coordinator: ExecutionCoordinator | None = None,
         cash_estimator: CashRequirementEstimator | None = None,
+        authority: AccountRuntimeAuthority | None = None,
     ) -> "MiniQmtRuntime":
         if not isinstance(config, MiniQmtRuntimeConfig):
             raise RuntimeConfigurationError("config must be MiniQmtRuntimeConfig")
@@ -263,17 +274,56 @@ class MiniQmtRuntime:
             environment=config.environment,
             qmt_path=qmt_path,
         )
-        if coordinator is None and config.coordination_path is not None:
-            coordinator = SQLiteExecutionCoordinator(config.coordination_path)
-        if config.runtime_lock_mode == "shared" and coordinator is None:
-            raise RuntimeConfigurationError(
-                "shared runtime mode requires coordination_path or injected coordinator"
-            )
         account_key = account_key_from_binding_identity(
             environment=binding.environment,
             account_type=binding.account_type,
             account_id_sha256=binding.account_id_sha256,
         )
+        if coordinator is None and config.runtime_lock_mode == "shared":
+            # Core 0.4.1: production shared mode resolves the account Runtime
+            # Authority ONLY — a single non-strategy-selectable host/user
+            # canonical root, verify-only (bootstrap=False).  The strategy
+            # must NOT decide the coordination DB path or the authority root.
+            # First initialization is an explicit operator action
+            # (`qmt-execution-core bootstrap-authority`); a missing Authority
+            # during normal runtime FAILS CLOSED and never auto-creates a
+            # replacement domain.
+            root = (
+                authority.root
+                if isinstance(authority, AccountRuntimeAuthority)
+                else default_authority_root()
+            )
+            try:
+                resolved = AccountRuntimeAuthority(root).resolve(
+                    account_key=account_key,
+                    environment=binding.environment,
+                    account_type=binding.account_type,
+                    account_id_sha256=binding.account_id_sha256,
+                    coordination_db_path=None,
+                    bootstrap=False,
+                )
+            except RuntimeAuthorityError as exc:
+                raise RuntimeConfigurationError(
+                    "shared runtime requires an initialized account Runtime "
+                    "Authority (missing, corrupt, or identity-mismatched); "
+                    "run the explicit operator bootstrap "
+                    "(`qmt-execution-core bootstrap-authority`) before "
+                    "starting strategy runtimes"
+                ) from exc
+            coordinator = SQLiteExecutionCoordinator(
+                resolved.coordination_db_path,
+                expected_identity=CoordinationDbIdentity(
+                    schema_version=1,
+                    account_key=resolved.account_key,
+                    db_uuid=resolved.coordination_db_uuid,
+                    authority_id=resolved.authority_id,
+                ),
+            )
+        if config.runtime_lock_mode == "shared" and coordinator is None:
+            raise RuntimeConfigurationError(
+                "shared runtime mode requires the account Runtime Authority "
+                "or an explicitly injected coordinator (low-level/test API)"
+            )
 
         gate = RuntimeExecutionGate(
             RuntimeGateConfig(

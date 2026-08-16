@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -181,7 +182,6 @@ def _config(
     binding_path: Path,
     *,
     strategy: str,
-    coordination_path: Path | None,
     session_id: int | None = None,
 ) -> MiniQmtRuntimeConfig:
     return MiniQmtRuntimeConfig(
@@ -192,7 +192,6 @@ def _config(
         lock_path=tmp_path / f"{strategy}-exec.lock",
         strategy_name=strategy,
         runtime_lock_mode="shared",
-        coordination_path=coordination_path,
         session_id=session_id,
         session_id_pool_start=210_000_000,
         session_id_pool_size=16,
@@ -213,7 +212,8 @@ def _request(strategy: str, client: str, symbol: str) -> ExecutionRequest:
     )
 
 
-def _connect(config: MiniQmtRuntimeConfig, factory, *, estimator=True):
+def _connect(config: MiniQmtRuntimeConfig, factory, *, estimator=True,
+             coordinator=None, authority=None):
     return MiniQmtRuntime.connect(
         config,
         guard=AllowGuard(),
@@ -226,22 +226,87 @@ def _connect(config: MiniQmtRuntimeConfig, factory, *, estimator=True):
             if estimator
             else None
         ),
+        coordinator=coordinator,
+        authority=authority,
     )
 
 
-def test_shared_mode_requires_durable_coordinator(tmp_path: Path):
+def test_shared_mode_without_explicit_path_uses_authority(tmp_path: Path):
+    # Core 0.4.1: production shared mode resolves the Account Runtime
+    # Authority (canonical per-account domain) — the strategy never selects
+    # the coordination DB path or the authority root.  The Authority must be
+    # initialized by the explicit operator bootstrap first; the runtime only
+    # verifies.
+    from qmt_execution_core import AccountRuntimeAuthority
+
     qmt_path = tmp_path / "userdata_mini"
     qmt_path.mkdir()
     binding = _binding(tmp_path, qmt_path)
-    config = _config(
-        tmp_path,
-        qmt_path,
-        binding,
-        strategy="a",
-        coordination_path=None,
+    config = _config(tmp_path, qmt_path, binding, strategy="a")
+    store = AccountRuntimeAuthority(tmp_path / "authority")
+    binding_payload = json.loads(binding.read_text(encoding="utf-8"))
+    account_key = account_key_from_binding_identity(
+        environment="simulation", account_type=2,
+        account_id_sha256=binding_payload["account_id_sha256"],
+    )
+    store.resolve(
+        account_key=account_key, environment="simulation", account_type=2,
+        account_id_sha256=binding_payload["account_id_sha256"],
+        coordination_db_path=None, bootstrap=True,
+    )
+    runtime = _connect(
+        config, lambda path, sid: FakeTrader(path, sid), authority=store,
+    )
+    try:
+        from qmt_execution_core.coordinated_session import CoordinatedExecutionSession
+
+        assert isinstance(runtime.session, CoordinatedExecutionSession)
+        # The coordinator is Authority-bound (identity verified).
+        assert runtime.session.coordinator.expected_identity is not None
+        assert list((tmp_path / "authority").glob("*.authority.json"))
+    finally:
+        runtime.close()
+
+
+def test_shared_mode_missing_authority_fails_closed_no_bootstrap(tmp_path: Path):
+    # P1-2: normal runtime must NOT auto-bootstrap a missing Authority.
+    from qmt_execution_core import AccountRuntimeAuthority
+    from qmt_execution_core.exceptions import RuntimeConfigurationError
+
+    qmt_path = tmp_path / "userdata_mini"
+    qmt_path.mkdir()
+    binding = _binding(tmp_path, qmt_path)
+    config = _config(tmp_path, qmt_path, binding, strategy="a")
+    store = AccountRuntimeAuthority(tmp_path / "authority")
+    with pytest.raises(RuntimeConfigurationError):
+        _connect(config, lambda path, sid: FakeTrader(path, sid), authority=store)
+    # No Authority / coordination DB was created by the failed runtime.
+    assert not list((tmp_path / "authority").glob("*.authority.json"))
+    assert not list((tmp_path / "authority").glob("*.coordination.db"))
+
+
+def test_shared_mode_corrupt_authority_fails_closed_no_fallback(tmp_path: Path):
+    # Fail closed on a corrupt Authority; no fallback domain is created.
+    from qmt_execution_core import AccountRuntimeAuthority
+    from qmt_execution_core.exceptions import RuntimeConfigurationError
+
+    qmt_path = tmp_path / "userdata_mini"
+    qmt_path.mkdir()
+    binding = _binding(tmp_path, qmt_path)
+    config = _config(tmp_path, qmt_path, binding, strategy="a")
+    store = AccountRuntimeAuthority(tmp_path / "authority")
+    binding_payload = json.loads(binding.read_text(encoding="utf-8"))
+    account_key = account_key_from_binding_identity(
+        environment="simulation", account_type=2,
+        account_id_sha256=binding_payload["account_id_sha256"],
+    )
+    (tmp_path / "authority").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "authority" / f"{account_key}.authority.json").write_text(
+        "{broken", encoding="utf-8"
     )
     with pytest.raises(RuntimeConfigurationError):
-        _connect(config, lambda path, sid: FakeTrader(path, sid))
+        _connect(config, lambda path, sid: FakeTrader(path, sid), authority=store)
+    assert not list((tmp_path / "authority").glob("*.coordination.db"))
 
 
 def test_two_shared_runtimes_same_qmt_path_different_symbols_coexist(tmp_path: Path):
@@ -260,12 +325,14 @@ def test_two_shared_runtimes_same_qmt_path_different_symbols_coexist(tmp_path: P
         return holders["b"]
 
     a = _connect(
-        _config(tmp_path, qmt_path, binding, strategy="a", coordination_path=coordination),
+        _config(tmp_path, qmt_path, binding, strategy="a"),
         factory_a,
+        coordinator=SQLiteExecutionCoordinator(coordination),
     )
     b = _connect(
-        _config(tmp_path, qmt_path, binding, strategy="b", coordination_path=coordination),
+        _config(tmp_path, qmt_path, binding, strategy="b"),
         factory_b,
+        coordinator=SQLiteExecutionCoordinator(coordination),
     )
     try:
         assert a.session_id != b.session_id
@@ -293,12 +360,14 @@ def test_same_account_same_symbol_second_runtime_is_rejected_before_broker(tmp_p
         return build
 
     a = _connect(
-        _config(tmp_path, qmt_path, binding, strategy="a", coordination_path=coordination),
+        _config(tmp_path, qmt_path, binding, strategy="a"),
         factory("a"),
+        coordinator=coordinator,
     )
     b = _connect(
-        _config(tmp_path, qmt_path, binding, strategy="b", coordination_path=coordination),
+        _config(tmp_path, qmt_path, binding, strategy="b"),
         factory("b"),
+        coordinator=coordinator,
     )
     try:
         assert a.submit(_request("a", "a1", "0700.HK")).state is TradeState.WORKING
@@ -337,12 +406,14 @@ def test_same_symbol_different_accounts_are_independent(tmp_path: Path):
         return holders["b"]
 
     a = _connect(
-        _config(tmp_path, qmt_path, binding_a, strategy="a", coordination_path=coordination),
+        _config(tmp_path, qmt_path, binding_a, strategy="a"),
         factory_a,
+        coordinator=SQLiteExecutionCoordinator(coordination),
     )
     b = _connect(
-        _config(tmp_path, qmt_path, binding_b, strategy="b", coordination_path=coordination),
+        _config(tmp_path, qmt_path, binding_b, strategy="b"),
         factory_b,
+        coordinator=SQLiteExecutionCoordinator(coordination),
     )
     try:
         assert a.submit(_request("a", "a1", "0700.HK")).state is TradeState.WORKING
@@ -366,9 +437,10 @@ def test_coordinated_buy_without_estimator_fails_before_broker(tmp_path: Path):
         return holder["trader"]
 
     runtime = _connect(
-        _config(tmp_path, qmt_path, binding, strategy="a", coordination_path=coordination),
+        _config(tmp_path, qmt_path, binding, strategy="a"),
         factory,
         estimator=False,
+        coordinator=SQLiteExecutionCoordinator(coordination),
     )
     try:
         out = runtime.submit(_request("a", "a1", "0700.HK"))
@@ -389,7 +461,6 @@ def test_exact_shared_session_id_is_exclusive_lease(tmp_path: Path):
         qmt_path,
         binding,
         strategy="a",
-        coordination_path=coordination,
         session_id=exact,
     )
     b_cfg = replace(
@@ -398,19 +469,22 @@ def test_exact_shared_session_id_is_exclusive_lease(tmp_path: Path):
             qmt_path,
             binding,
             strategy="b",
-            coordination_path=coordination,
         ),
         session_id=exact,
     )
-    a = _connect(a_cfg, lambda path, sid: FakeTrader(path, sid))
+    coordinator = SQLiteExecutionCoordinator(coordination)
+    a = _connect(a_cfg, lambda path, sid: FakeTrader(path, sid),
+                 coordinator=coordinator)
     try:
         with pytest.raises(SessionIdUnavailable):
-            _connect(b_cfg, lambda path, sid: FakeTrader(path, sid))
+            _connect(b_cfg, lambda path, sid: FakeTrader(path, sid),
+                     coordinator=coordinator)
     finally:
         a.close()
 
     # Lease is OS/file-lock lifetime based and becomes reusable after close.
-    b = _connect(b_cfg, lambda path, sid: FakeTrader(path, sid))
+    b = _connect(b_cfg, lambda path, sid: FakeTrader(path, sid),
+                 coordinator=coordinator)
     assert b.session_id == exact
     b.close()
 
@@ -432,12 +506,12 @@ def test_automatic_shared_session_id_connect_failure_has_finite_fallback(tmp_pat
             qmt_path,
             binding,
             strategy="fallback",
-            coordination_path=coordination,
         ),
         session_id_pool_size=4,
         session_id_attempts=2,
     )
-    runtime = _connect(config, factory)
+    runtime = _connect(config, factory,
+                       coordinator=SQLiteExecutionCoordinator(coordination))
     try:
         assert len(tried) == 2
         assert tried[0] != tried[1]
