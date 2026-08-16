@@ -182,6 +182,8 @@ class MiniQmtRuntime:
         xtconstant: object | None = None,
         callback_base: type | None = None,
         auto_open: bool = True,
+        before_broker_submit: Callable[[ExecutionRequest], None] | None = None,
+        before_broker_cancel: Callable[[int], None] | None = None,
     ) -> "MiniQmtRuntime":
         if not isinstance(config, MiniQmtRuntimeConfig):
             raise RuntimeConfigurationError("config must be MiniQmtRuntimeConfig")
@@ -309,6 +311,8 @@ class MiniQmtRuntime:
                 journal_path=config.journal_path,
                 lock_path=config.lock_path,
                 execution_id=config.strategy_name,
+                before_broker_submit=before_broker_submit,
+                before_broker_cancel=before_broker_cancel,
             )
             runtime = cls(
                 config=config,

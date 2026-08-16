@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from .domain import (
     BrokerOrder,
@@ -28,11 +29,27 @@ from .state_machine import MachineSnapshot, TRANSITIONS, advance
 from .verifier import verify_state_machine
 
 
+def _noop_submit(request: ExecutionRequest) -> None:
+    return None
+
+
+def _noop_cancel(order_id: int) -> None:
+    return None
+
+
 class ExecutionSession:
     """Reusable one-execution-at-a-time fail-closed session.
 
     The session owns its execution mutex for the whole open lifetime. Releasing
     the mutex via `close()` irreversibly disables further calls on this object.
+
+    ``before_broker_submit`` / ``before_broker_cancel`` are broker-neutral
+    sidecar lifecycle hooks (TGrid migration Phase A): they execute
+    synchronously on the execution (calling) thread AFTER the core durable
+    intent / cancel-intent is persisted and BEFORE the broker side effect.
+    A raised hook proves the broker call was never invoked and fails closed;
+    a hook must never create a blind-retry path from UNKNOWN.  Defaults are
+    no-ops so existing callers are unchanged.
     """
 
     def __init__(
@@ -43,11 +60,23 @@ class ExecutionSession:
         journal_path: Path | str,
         lock_path: Path | str,
         execution_id: str = "default",
+        before_broker_submit: Callable[[ExecutionRequest], None] | None = None,
+        before_broker_cancel: Callable[[int], None] | None = None,
     ) -> None:
+        if before_broker_submit is not None and not callable(before_broker_submit):
+            raise TypeError("before_broker_submit must be callable or None")
+        if before_broker_cancel is not None and not callable(before_broker_cancel):
+            raise TypeError("before_broker_cancel must be callable or None")
         self.broker = broker
         self.guard = guard
         self.journal = ExecutionJournal(journal_path, execution_id=execution_id)
         self.mutex = ExecutionMutex(lock_path)
+        self._before_broker_submit: Callable[[ExecutionRequest], None] = (
+            before_broker_submit or _noop_submit
+        )
+        self._before_broker_cancel: Callable[[int], None] = (
+            before_broker_cancel or _noop_cancel
+        )
         self._snapshot = MachineSnapshot()
         self._open = False
         self._closed = False
@@ -163,6 +192,13 @@ class ExecutionSession:
             details={"client_order_id": request.client_order_id},
         )
 
+        # Phase A sidecar seam: runs AFTER the core durable intent is
+        # committed and BEFORE BrokerPort.place_order(). A raised hook
+        # propagates out of submit() and proves the broker submit was NEVER
+        # invoked (fail closed); the durable intent makes restart recovery
+        # fail closed (no blind resend).
+        self._before_broker_submit(request)
+
         try:
             order_id = self.broker.place_order(request)
         except BrokerSubmissionRejected as exc:
@@ -225,6 +261,11 @@ class ExecutionSession:
 
         self.journal.persist_cancel_intent()
         self._transition(TradeEvent.CANCEL_REQUESTED)
+        # Phase A sidecar seam: runs AFTER the core durable cancel-intent is
+        # committed and BEFORE BrokerPort.cancel_order(). A raised hook
+        # propagates and proves the broker cancel was NEVER invoked (fail
+        # closed); the durable cancel intent makes restart recovery safe.
+        self._before_broker_cancel(order_id)
         try:
             result = self.broker.cancel_order(order_id)
         except BrokerError:

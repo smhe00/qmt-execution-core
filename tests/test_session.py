@@ -79,13 +79,14 @@ def req():
     return ExecutionRequest("c1", "510300.SH", Side.BUY, 100, 4.7, "demo", "demo_1")
 
 
-def session(tmp_path: Path, broker=None, guard=None):
+def session(tmp_path: Path, broker=None, guard=None, **hooks):
     return ExecutionSession(
         broker=broker or FakeBroker(),
         guard=guard or AllowGuard(),
         journal_path=tmp_path / "journal.json",
         lock_path=tmp_path / "exec.lock",
         execution_id="test",
+        **hooks,
     )
 
 
@@ -243,3 +244,95 @@ def test_release_lock_closes_session_for_new_orders(tmp_path):
     s.close()
     with pytest.raises(SessionClosedError):
         s.submit(req())
+
+
+def test_before_submit_hook_runs_after_durable_intent_before_broker(tmp_path):
+    # Phase A sidecar: the hook fires with the core durable intent already
+    # persisted and broker.place_order NOT yet invoked (ordering invariant).
+    broker = FakeBroker()
+    observed = []
+
+    def hook(request):
+        assert request.client_order_id == "c1"
+        assert broker.place_calls == 0  # before broker side effect
+        assert s.journal.data.get("intent") is not None  # after durable intent
+        observed.append(("hook", broker.place_calls))
+
+    s = session(tmp_path, broker=broker, before_broker_submit=hook)
+    s.open()
+    out = s.submit(req())
+    assert out.state is TradeState.WORKING
+    assert broker.place_calls == 1
+    assert observed == [("hook", 0)]
+    s.close()
+
+
+def test_before_submit_hook_failure_proves_broker_not_called(tmp_path):
+    # Phase A fail-closed: a raised pre-submit hook proves broker.place_order
+    # was never invoked; restart recovery fails closed with NO blind resend.
+    broker = FakeBroker()
+
+    def hook(request):
+        raise RuntimeError("tgrid durable ledger commit failed")
+
+    s = session(tmp_path, broker=broker, before_broker_submit=hook)
+    s.open()
+    with pytest.raises(RuntimeError):
+        s.submit(req())
+    assert broker.place_calls == 0
+    s.close()
+
+    s2 = session(tmp_path, broker=broker, before_broker_submit=hook)
+    out = s2.open()
+    assert out.state is TradeState.FAILED  # fail closed, no blind resend
+    assert broker.place_calls == 0
+    s2.close()
+
+
+def test_before_cancel_hook_ordering(tmp_path):
+    # Phase A pre-cancel sidecar: fires after durable cancel intent, before
+    # the broker cancel side effect; the durable order is still WORKING when
+    # the hook observes it.
+    broker = FakeBroker()
+    seen = []
+
+    def hook(order_id):
+        assert broker.orders[order_id].status is BrokerOrderStatus.WORKING
+        seen.append(order_id)
+
+    s = session(tmp_path, broker=broker, before_broker_cancel=hook)
+    s.open()
+    out = s.submit(req())
+    oid = out.broker_order_id
+    s.cancel()
+    assert seen == [oid]
+    s.close()
+
+
+def test_before_cancel_hook_failure_proves_cancel_not_called(tmp_path):
+    # Phase A fail-closed: a raised pre-cancel hook proves broker.cancel_order
+    # was never invoked (order stays WORKING).
+    broker = FakeBroker()
+
+    def fail_hook(order_id):
+        raise RuntimeError("tgrid cancel accounting failed")
+
+    s = session(tmp_path, broker=broker, before_broker_cancel=fail_hook)
+    s.open()
+    out = s.submit(req())
+    oid = out.broker_order_id
+    with pytest.raises(RuntimeError):
+        s.cancel()
+    assert broker.orders[oid].status is BrokerOrderStatus.WORKING
+    s.close()
+
+
+def test_hooks_are_noop_by_default(tmp_path):
+    # Backward compatibility: no hooks -> identical submit/cancel lifecycle.
+    broker = FakeBroker()
+    s = session(tmp_path, broker=broker)
+    s.open()
+    out = s.submit(req())
+    assert out.state is TradeState.WORKING
+    assert s.cancel().state is TradeState.CANCELLING
+    s.close()
