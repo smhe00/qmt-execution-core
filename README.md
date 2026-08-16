@@ -197,6 +197,7 @@ protected execution source files.
 
 See:
 
+- **[Frozen v0.4 formal specification](docs/CORE_SPEC_V0_4_RESOURCE_COORDINATION.md)**
 - [Architecture](docs/ARCHITECTURE.md)
 - [State-machine specification](docs/STATE_MACHINE_SPEC.md)
 - [MiniQMT profile](docs/MINIQMT_PROFILE.md)
