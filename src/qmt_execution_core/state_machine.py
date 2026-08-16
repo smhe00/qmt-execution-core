@@ -46,6 +46,7 @@ TRANSITIONS: Mapping[TradeState, Mapping[TradeEvent, TradeState]] = {
         TradeEvent.FATAL: TradeState.FAILED,
     },
     TradeState.SUBMITTED: {
+        TradeEvent.PRE_BROKER_ABORTED: TradeState.FAILED,
         TradeEvent.SUBMIT_ACCEPTED: TradeState.ACCEPTED,
         TradeEvent.SUBMIT_REJECTED: TradeState.REJECTED,
         TradeEvent.SUBMIT_AMBIGUOUS: TradeState.UNKNOWN,
@@ -209,6 +210,17 @@ def advance(
             facts,
             intent_persisted=True,
             reservation_persisted=True,
+        )
+
+    elif event is TradeEvent.PRE_BROKER_ABORTED:
+        # The synchronous pre-broker hook failed before BrokerPort.place_order
+        # was invoked. The durable logical execution failed, but broker reality
+        # is resolved: no external order can exist from this attempt.
+        facts = replace(
+            facts,
+            submitted_once=False,
+            unresolved_order=False,
+            terminal_order_confirmed=True,
         )
 
     elif event is TradeEvent.SUBMIT_ACCEPTED:
