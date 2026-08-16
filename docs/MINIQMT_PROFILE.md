@@ -1,116 +1,112 @@
-# MiniQMT / XtQuant Adapter Profile
+# MiniQMT / XtQuant Adapter Profile — v0.4
 
-This document defines how MiniQMT/XtQuant broker observations are normalized into the generic execution core.
-The generic state machine never imports or interprets `xtquant` constants directly.
+本文定义 MiniQMT/XtQuant broker observation 如何归一化进入 Generic Execution Core。Generic state machine 不直接 import 或解释 `xtquant` 常量。
 
-Official API reference used for this profile: `https://dict.thinktrader.net/nativeApi/xttrader.html`.
-
-## 1. Layering
+## 1. 分层
 
 ```text
 XtQuant raw API / XtOrder
-        ↓
+        |
+        v
 MiniQmtBrokerAdapter
-        ↓
+        |
+        v
 BrokerOrderStatus
-        ↓
+        |
+        v
 event_for_observation(current_state, status)
-        ↓
+        |
+        v
 Generic TradeState
 ```
 
-Project strategy code must not branch on raw QMT values such as `50`, `55`, or `255`.
+策略代码不得直接按 `50 / 55 / 255` 等 QMT raw status 分支。
 
-## 2. QMT order_status normalization
+---
 
-| Raw status | Value | Normalized status | Generic meaning |
+## 2. order_status 归一化
+
+| QMT raw status | Value | Core normalized | 语义 |
 |---|---:|---|---|
-| `ORDER_UNREPORTED` | 48 | `ACCEPTED` | broker has an order object, not yet reported |
-| `ORDER_WAIT_REPORTING` | 49 | `ACCEPTED` | waiting to report |
-| `ORDER_REPORTED` | 50 | `WORKING` | active order |
-| `ORDER_REPORTED_CANCEL` | 51 | `CANCEL_PENDING` | cancel in progress |
-| `ORDER_PARTSUCC_CANCEL` | 52 | `CANCEL_PENDING` | partial fill + cancel in progress |
-| `ORDER_PART_CANCEL` | 53 | `PARTIAL_CANCELLED` | partial fill + remaining quantity cancelled |
-| `ORDER_CANCELED` | 54 | `CANCELLED` | cancelled terminal |
-| `ORDER_PART_SUCC` | 55 | `PARTIALLY_FILLED` | partial fill, remaining active |
-| `ORDER_SUCCEEDED` | 56 | `FILLED` | filled terminal |
-| `ORDER_JUNK` | 57 | `REJECTED` | rejected/junk terminal |
-| `ORDER_UNKNOWN` | 255 | `UNKNOWN` | unresolved |
-| any unrecognized value/type | other | `UNKNOWN` | fail closed |
+| `ORDER_UNREPORTED` | 48 | `ACCEPTED` | 已有订单对象，尚未报送完成 |
+| `ORDER_WAIT_REPORTING` | 49 | `ACCEPTED` | 等待报送 |
+| `ORDER_REPORTED` | 50 | `WORKING` | 活动订单 |
+| `ORDER_REPORTED_CANCEL` | 51 | `CANCEL_PENDING` | 撤单中 |
+| `ORDER_PARTSUCC_CANCEL` | 52 | `CANCEL_PENDING` | 部分成交 + 撤单中 |
+| `ORDER_PART_CANCEL` | 53 | `PARTIAL_CANCELLED` | 部分成交，剩余已确认取消 |
+| `ORDER_CANCELED` | 54 | `CANCELLED` | 已取消终态 |
+| `ORDER_PART_SUCC` | 55 | `PARTIALLY_FILLED` | 部分成交，剩余仍活动 |
+| `ORDER_SUCCEEDED` | 56 | `FILLED` | 全部成交 |
+| `ORDER_JUNK` | 57 | `REJECTED` | 券商拒绝 |
+| `ORDER_UNKNOWN` | 255 | `UNKNOWN` | 未解决 |
+| 未识别值/类型 | other | `UNKNOWN` | fail closed |
 
-### Critical distinctions
+矛盾 payload 也归一化为 `UNKNOWN`，例如 `ORDER_SUCCEEDED` 但 `filled_qty != qty`。
 
-```text
-52 PARTSUCC_CANCEL
-= filled_qty > 0 + cancel still pending
-= unresolved
+---
 
-53 PART_CANCEL
-= filled_qty > 0 + remaining quantity confirmed cancelled
-= terminal cancelled, preserve filled_qty
+## 3. 同步 order_stock() 语义
 
-55 PART_SUCC
-= filled_qty > 0 + remaining quantity still active
-= unresolved partial fill
-```
-
-The adapter performs consistency checks: contradictory payloads (for example status 56 with `filled_qty != qty`) are normalized to `UNKNOWN`.
-
-## 3. `order_stock()` semantics
-
-The adapter calls synchronous `order_stock()` through dependency injection.
-
-Normalized execution rules:
+0.4 仍以同步执行为主：
 
 ```text
 positive plain-int order id
-→ persist broker order id
-→ SUBMIT_ACCEPTED / ACCEPTED
-→ query broker order status
+ -> persist broker order id
+ -> SUBMIT_ACCEPTED
+ -> authoritative query
 
 -1
-→ BrokerSubmissionRejected
-→ REJECTED
+ -> BrokerSubmissionRejected
+ -> REJECTED
 
-exception / non-int / unexpected nonpositive result
-→ BrokerSubmissionAmbiguous
-→ UNKNOWN
+exception / malformed / unexpected nonpositive
+ -> BrokerSubmissionAmbiguous
+ -> UNKNOWN
 ```
 
-A positive order id is not a claim that the order is already `WORKING` or `FILLED`.
+positive order id 不等于 WORKING/FILLED，最终状态仍由 query 决定。
 
-## 4. `cancel_order_stock()` semantics
+`order_stock_async()` 不属于 0.4 execution path。
+
+---
+
+## 4. cancel_order_stock() 语义
 
 ```text
 return 0
-→ cancel request was accepted for sending
-→ CANCELLING
-→ mandatory re-query
+ -> cancel request accepted for sending
+ -> CANCELLING
+ -> mandatory re-query
 
-return -1 / other failure / exception
-→ CANCEL_REJECTED observation
-→ mandatory re-query of the original order
+return failure / exception
+ -> CANCEL_REJECTED
+ -> mandatory re-query
 ```
 
-`0` must never be normalized directly to `CANCELLED`.
-The order can fill while a cancel request is in flight.
+撤单请求成功永远不能直接归一化为 `CANCELLED`。
 
-## 5. Strict query semantics
+订单在撤单过程中成交时，broker `FILLED` 是最终事实。
 
-The adapter retries `query_stock_order()` / `query_stock_orders()` a bounded number of times.
+---
+
+## 5. Strict Query
+
+`query_stock_order()` / `query_stock_orders()` 采用 bounded retry：
 
 ```text
-non-None result = usable broker response
-None            = ambiguous, retry
-exception       = ambiguous, retry
-bounded failure = BrokerQueryAmbiguous
+non-None usable result -> broker observation
+None                   -> ambiguous, retry
+exception              -> ambiguous, retry
+bounded failure        -> BrokerQueryAmbiguous
 ```
 
-In particular, `None` is never silently converted to an empty order list in the execution core.
+`None` 不会被静默转换成“没有订单”。
 
-## 6. Recovery identity
+---
 
-If submit outcome is unknown and the broker order id was not captured, the core queries all managed orders and matches the **durable local identity**:
+## 6. Recovery Identity
+
+当 submit outcome UNKNOWN 且没有捕获 broker order id 时，Core 查询 managed orders 并匹配 durable local identity：
 
 ```text
 order_remark
@@ -119,77 +115,104 @@ side
 qty
 ```
 
-Exactly one match is required.
-A caller-provided temporary remark is not recovery authority.
+必须得到唯一匹配；0 或多个匹配都 fail closed。
 
-## 7. Callback isolation
+---
 
-`QmtCallbackBridge` converts broker callbacks into immutable observations only:
+## 7. Account Resource Queries
+
+`MiniQmtBrokerAdapter` 还提供账户只读事实，例如：
 
 ```text
-on_stock_order  → QmtOrderObserved
-on_stock_trade  → QmtTradeObserved
-on_disconnected → QmtBrokerDisconnected
-on_order_error  → QmtOrderErrorObserved
-on_cancel_error → QmtCancelErrorObserved
+query_asset()
+query_positions()
+query_trades()
 ```
 
-Callbacks do not:
+0.4 通过独立 `AccountResourcePort` 使用 `query_asset()` 支持 coordinated BUY，而不扩大所有 `BrokerPort` 实现的强制接口。
 
-- mutate state-machine state;
-- write the journal;
-- release reservations;
-- send/cancel orders;
-- retry UNKNOWN submissions;
-- clear a safety halt.
+Shared BUY 每次都读取 fresh authoritative broker cash，再与 SQLite active reservations 合并判断。
 
-A production integration should enqueue these observations onto a single execution/event thread.
+---
 
-## 8. Disconnect model
+## 8. Callback Isolation
 
-`MiniQmtBrokerAdapter.mark_disconnected()` makes `execution_healthy()` false and therefore blocks new execution requests.
+```text
+on_stock_order  -> QmtOrderObserved
+on_stock_trade  -> QmtTradeObserved
+on_disconnected -> QmtBrokerDisconnected
+on_order_error  -> QmtOrderErrorObserved
+on_cancel_error -> QmtCancelErrorObserved
+```
 
-A future production session bootstrap must not restore order capability merely because transport reconnects. The production recovery sequence should be:
+Callback 不会：
+
+- 直接改变策略状态；
+- 直接修改 journal/coordination DB；
+- submit/cancel；
+- blind retry UNKNOWN；
+- 清除安全 halt。
+
+所有 observation 进入 bounded serial EventQueue。
+
+---
+
+## 9. Disconnect / Recovery
+
+断线首先使 execution health 失效。
+
+恢复：
 
 ```text
 transport reconnect
 → exact bound account verification
 → subscribe
 → strict broker query
-→ reconcile durable state
-→ runtime reconfirmation
-→ restore new-order capability
+→ durable execution reconciliation
+→ project session evidence verification
+→ runtime recovery complete
+→ live mode fresh confirmation
 ```
 
-That production session/account-binding layer is intentionally outside v0.1.
+仅收到 `ACCOUNT_STATUS_OK` 或 transport reconnect 不足以重新开放订单权限。
 
-## 9. Refinement test matrix
+---
 
-Minimum adapter tests:
+## 10. Multi-runtime shared mode
+
+0.4 支持同一个 QMT userdata path 上多个独立 runtime：
 
 ```text
-48 → ACCEPTED
-49 → ACCEPTED
-50 → WORKING
-51 → CANCEL_PENDING
-52 + valid partial fill → CANCEL_PENDING
-53 + valid partial fill → PARTIAL_CANCELLED
-54 → CANCELLED
-55 + valid partial fill → PARTIALLY_FILLED
-56 + full fill → FILLED
-57 → REJECTED
-255 → UNKNOWN
-unexpected raw status → UNKNOWN
-positive order_stock id → accepted id, not fill claim
-order_stock -1 → definitive reject
-submit exception → ambiguous/UNKNOWN
-query None → ambiguous, not empty
-cancel 0 → request accepted, not CANCELLED
-partial fill + cancel → fill preserved
+runtime_lock_mode="shared"
 ```
 
-## 10. Dependency boundary
+此时：
 
-`src/qmt_execution_core/miniqmt/` intentionally does not import `xtquant` at module import time.
-Production code supplies an already-constructed trader/account and numeric QMT order configuration.
-This keeps CI and generic tests independent of a MiniQMT installation and allows other broker adapters to reuse the same execution core.
+- 不使用 qmt-path-wide exclusive runtime mutex；
+- 每个 runtime 获得不同的 bounded session-id lease；
+- 同 `(account_key,symbol)` 冲突由 SQLite claim 阻止；
+- 同账户 BUY cash race 由 SQLite reservation 阻止；
+- 不同标的允许并发。
+
+默认仍为：
+
+```text
+runtime_lock_mode="exclusive"
+```
+
+保持旧项目的最保守行为。
+
+---
+
+## 11. Dependency Boundary
+
+`src/qmt_execution_core/miniqmt/` 不在模块 import 时强制 import `xtquant`。
+
+真实 MiniQMT 环境通过 lazy import 或 dependency injection 提供：
+
+- trader factory；
+- StockAccount；
+- constants；
+- callback base。
+
+因此 CI 可以完全使用 fake XtQuant，不触发真实/模拟 QMT 订单。
