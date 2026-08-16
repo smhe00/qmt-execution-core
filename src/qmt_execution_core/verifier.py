@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .domain import PrecheckEvidence, SessionEvidence, TradeEvent, TradeState
 from .finality import ExecutionFinality, execution_finality
+from .formal import verify_runtime_transition_refinement, verify_three_process_coordination
 from .state_machine import (
     InvalidTransition,
     MachineSnapshot,
@@ -31,6 +32,7 @@ PROTECTED_EXECUTION_SOURCES = (
     "finality.py",
     "coordination.py",
     "coordinated_session.py",
+    "formal.py",
     "verifier.py",
     "miniqmt/status.py",
     "miniqmt/adapter.py",
@@ -93,6 +95,8 @@ def _assert_v04_finality_refinement(snapshot: MachineSnapshot) -> None:
 
 
 def verify_state_machine(*, source_root: Path | None = None) -> dict[str, object]:
+    """Fast single-process proof used by ExecutionSession.open()."""
+
     initial = initial_snapshot()
     queue = deque([initial])
     reachable = {initial}
@@ -169,6 +173,22 @@ def verify_state_machine(*, source_root: Path | None = None) -> dict[str, object
         "transition_spec_sha256": transition_spec_sha256(),
         "execution_source_sha256": execution_source_sha256(source_root),
     }
+
+
+def verify_release_model(*, source_root: Path | None = None) -> dict[str, object]:
+    """Full release gate: abstract machine + Python refinement + 3-process product.
+
+    The expensive three-process state-space proof intentionally does not run on
+    every ExecutionSession.open(); the CLI/CI release gate invokes this function.
+    """
+
+    report = verify_state_machine(source_root=source_root)
+    report["implementation_refinement"] = verify_runtime_transition_refinement(
+        source_root=source_root
+    )
+    report["three_process_coordination"] = verify_three_process_coordination()
+    report["release_formal_verification"] = "PASS"
+    return report
 
 
 def transition_spec_sha256() -> str:
