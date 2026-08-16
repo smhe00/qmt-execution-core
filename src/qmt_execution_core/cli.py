@@ -5,7 +5,7 @@ import getpass
 import json
 from pathlib import Path
 
-from .authority import AccountRuntimeAuthority
+from .authority import AccountRuntimeAuthority, default_authority_root
 from .coordination import account_key_from_binding_identity
 from .miniqmt.binding import QmtAccountBinding
 from .miniqmt.runtime_gate import token_sha256
@@ -39,15 +39,11 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "explicit operator first-initialization of the account Runtime "
             "Authority (Core 0.4.1): creates the dedicated coordination DB and "
-            "the canonical Authority under the per-account OS lock"
+            "the canonical Authority under the per-account OS lock at the "
+            "non-overridable canonical host/user root"
         ),
     )
     bootstrap.add_argument("--binding", required=True)
-    bootstrap.add_argument(
-        "--authority-root",
-        default=None,
-        help="operator/test override of the canonical authority root",
-    )
 
     token = sub.add_parser(
         "hash-token",
@@ -82,14 +78,9 @@ def main(argv: list[str] | None = None) -> int:
             account_type=account_type,
             account_id_sha256=account_id_sha256,
         )
-        # Explicit operator bootstrap uses the canonical host/user root unless
-        # an explicit operator/test override is supplied.
-        from .authority import default_authority_root
-
-        root = Path(args.authority_root) if args.authority_root else None
-        resolved = AccountRuntimeAuthority(
-            root if root is not None else default_authority_root()
-        ).resolve(
+        # Operator bootstrap and normal runtime share the SAME canonical,
+        # non-overridable root resolver (default_authority_root).
+        resolved = AccountRuntimeAuthority(default_authority_root()).resolve(
             account_key=account_key,
             environment=environment,
             account_type=account_type,

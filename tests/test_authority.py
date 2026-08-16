@@ -8,6 +8,7 @@ live in test_authority_cross_process.py.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -585,4 +586,96 @@ class TestDefaultAuthorityRoot:
         assert root.is_absolute()
         assert root.name == "authority"
         assert default_authority_root() == root
+
+
+class TestCanonicalRootNonOverridable:
+    @pytest.mark.skipif(os.name != "nt", reason="Windows Known Folder API")
+    def test_windows_localappdata_env_is_ignored(self, monkeypatch, tmp_path):
+        baseline = default_authority_root()
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "fake-localappdata"))
+        # Mutable process environment must not change the canonical root.
+        assert default_authority_root() == baseline
+        assert not str(default_authority_root()).startswith(
+            str(tmp_path / "fake-localappdata")
+        )
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows Known Folder API")
+    def test_windows_known_folder_failure_fails_closed(self, monkeypatch):
+        from qmt_execution_core import authority as auth_mod
+
+        def _boom():
+            raise RuntimeAuthorityError("forced Known Folder failure")
+
+        monkeypatch.setattr(auth_mod, "_windows_known_folder_local_appdata", _boom)
+        with pytest.raises(RuntimeAuthorityError):
+            default_authority_root()
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX user database")
+    def test_posix_user_db_failure_fails_closed(self, monkeypatch):
+        from qmt_execution_core import authority as auth_mod
+
+        def _boom():
+            raise RuntimeAuthorityError("forced user-database failure")
+
+        monkeypatch.setattr(auth_mod, "_posix_user_home", _boom)
+        with pytest.raises(RuntimeAuthorityError):
+            default_authority_root()
+
+
+class TestBootstrapAuthorityCli:
+    def test_help_has_no_authority_root_option(self, capsys):
+        from qmt_execution_core import cli
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["bootstrap-authority", "--help"])
+        assert exc.value.code == 0
+        assert "--authority-root" not in capsys.readouterr().out
+
+    def test_bootstrap_cli_and_runtime_share_canonical_root(
+        self, tmp_path, monkeypatch
+    ):
+        # P1: operator bootstrap and normal runtime MUST call the same
+        # canonical resolver.  Monkeypatch both namespaces to one temp root
+        # and prove bootstrap then runtime-verify land on the same Authority.
+        from qmt_execution_core import cli as cli_mod
+        from qmt_execution_core.miniqmt import runtime as runtime_mod
+
+        canonical = tmp_path / "canonical-auth"
+        monkeypatch.setattr(cli_mod, "default_authority_root", lambda: canonical)
+        monkeypatch.setattr(runtime_mod, "default_authority_root", lambda: canonical)
+
+        qmt = tmp_path / "qmt"
+        qmt.mkdir(parents=True, exist_ok=True)
+        binding_path = tmp_path / "binding.json"
+        QmtAccountBinding.create(
+            environment="simulation", account_type=2, account_id="A123",
+            qmt_path=qmt,
+        ).write(binding_path)
+
+        cli_mod.main(["bootstrap-authority", "--binding", str(binding_path)])
+        assert list(canonical.glob("*.authority.json"))
+
+        config = MiniQmtRuntimeConfig(
+            environment="simulation", qmt_path=qmt, binding_path=binding_path,
+            journal_path=tmp_path / "j.json", lock_path=tmp_path / "e.lock",
+            strategy_name="demo", query_delay_seconds=0,
+            runtime_lock_mode="shared",
+        )
+        holder = {}
+
+        def factory(path, session_id):
+            trader = FakeTrader(path, session_id)
+            holder["trader"] = trader
+            return trader
+
+        runtime = MiniQmtRuntime.connect(
+            config, guard=AllowGuard(), trader_factory=factory,
+            stock_account_factory=StockAccount, xtconstant=XtConstant,
+            callback_base=CallbackBase, cash_estimator=_zero_estimator(),
+        )
+        try:
+            assert runtime.session.coordinator.expected_identity is not None
+            assert holder["trader"].place_calls == 0  # verify-only, no side effect
+        finally:
+            runtime.close()
 

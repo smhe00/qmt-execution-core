@@ -8,12 +8,14 @@ the OS-backed authority lock is genuinely cross-process.
 from __future__ import annotations
 
 import multiprocessing
+import os
 import time
 from pathlib import Path
 
 import pytest
 
 from qmt_execution_core import AccountRuntimeAuthority
+from qmt_execution_core.authority import default_authority_root
 from qmt_execution_core.coordination import account_key_from_binding_identity
 from qmt_execution_core.mutex import ConcurrentExecutionError, ExecutionMutex
 
@@ -24,6 +26,15 @@ def _account_key() -> str:
     return account_key_from_binding_identity(
         environment="simulation", account_type=2, account_id_sha256=_SHA,
     )
+
+
+def _localappdata_root_worker(fake_localappdata: str, queue) -> None:
+    """Report the canonical root while carrying a mutated LOCALAPPDATA."""
+    os.environ["LOCALAPPDATA"] = fake_localappdata
+    try:
+        queue.put({"ok": True, "root": str(default_authority_root())})
+    except Exception as exc:  # noqa: BLE001 - report across process boundary
+        queue.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
 
 def _bootstrap_worker(root: str, account_key: str, queue) -> None:
@@ -104,3 +115,28 @@ class TestCrossProcessBootstrap:
         mutex.release()
         holder.join(timeout=10)
         assert holder.exitcode == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Known Folder API")
+def test_windows_two_processes_different_localappdata_same_root(tmp_path):
+    # Rev3 P1: two real processes carrying DIFFERENT LOCALAPPDATA values must
+    # still resolve the same canonical root for the same OS user.
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_localappdata_root_worker,
+            args=(str(tmp_path / f"fake-{index}"), queue),
+        )
+        for index in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+        assert process.exitcode == 0, process.exitcode
+    results = [queue.get(timeout=5) for _ in range(2)]
+    assert all(result["ok"] for result in results), results
+    assert results[0]["root"] == results[1]["root"]
+    assert results[0]["root"] == str(default_authority_root())
+    assert str(tmp_path / "fake-0") not in results[0]["root"]

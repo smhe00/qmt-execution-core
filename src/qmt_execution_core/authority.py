@@ -48,33 +48,109 @@ _AUTHORITY_LOCK_TIMEOUT_SECONDS = 10.0
 def default_authority_root() -> Path:
     """Canonical host/user-level Core authority root (INV-AUTH-001).
 
-    NOT strategy-configurable and NOT derived from process-overridable
-    environment (no XDG_DATA_HOME / $HOME overrides): every strategy process
-    for the same OS user on the same host must derive the identical root so
-    the same account cannot be split across two Authority/DB domains.
+    NOT strategy-configurable and NOT derived from mutable process
+    environment (no LOCALAPPDATA / USERPROFILE / HOME / Path.home / XDG
+    overrides).  The root comes from the OS user identity itself, so every
+    strategy process for the same OS user on the same host resolves the
+    identical root and the same account cannot be split across two
+    Authority/DB domains:
 
-    * Windows: ``%LOCALAPPDATA%\\qmt-execution-core\\authority`` (the
-      OS-known per-user application-data location);
-    * POSIX: the OS user's home from the user database (``pwd``) +
-      ``.local/share/qmt-execution-core/authority``.
+    * Windows: ``FOLDERID_LocalAppData`` via the Windows Known Folder API
+      (``SHGetKnownFolderPath``), never ``%LOCALAPPDATA%``;
+    * POSIX: the OS user's home from the user database (``pwd.getpwuid``),
+      never ``$HOME``.
+
+    If the authoritative OS lookup fails, this raises
+    :class:`RuntimeAuthorityError` and fails closed — it never falls back to
+    an environment-derived path.
 
     Tests inject an explicit root only through the low-level
     :class:`AccountRuntimeAuthority` / ``MiniQmtRuntime.connect(authority=)``
     API, never through production runtime configuration.
     """
     if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA")
-        if base:
-            return Path(base) / "qmt-execution-core" / "authority"
-        return Path.home() / "AppData" / "Local" / "qmt-execution-core" / "authority"
-    home = Path.home()
+        return (
+            _windows_known_folder_local_appdata()
+            / "qmt-execution-core"
+            / "authority"
+        )
+    return (
+        _posix_user_home()
+        / ".local"
+        / "share"
+        / "qmt-execution-core"
+        / "authority"
+    )
+
+
+def _windows_known_folder_local_appdata() -> Path:
+    """Resolve FOLDERID_LocalAppData through the Windows Known Folder API.
+
+    Isolated so tests can force a lookup failure without touching the OS.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class _GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", wintypes.DWORD),
+            ("Data2", wintypes.WORD),
+            ("Data3", wintypes.WORD),
+            ("Data4", wintypes.BYTE * 8),
+        ]
+
+    # FOLDERID_LocalAppData = {F1B32785-6FBA-4FCF-9D55-7B8E7F157091}
+    folder_id = _GUID(
+        0xF1B32785,
+        0x6FBA,
+        0x4FCF,
+        (wintypes.BYTE * 8)(0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91),
+    )
+    path_ptr = ctypes.c_wchar_p()
+    try:
+        hr = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(folder_id), 0, None, ctypes.byref(path_ptr)
+        )
+        if hr != 0 or not path_ptr.value:
+            raise RuntimeAuthorityError(
+                "Windows Known Folder lookup failed (FOLDERID_LocalAppData); "
+                "cannot resolve a canonical authority root"
+            )
+        return Path(path_ptr.value)
+    except RuntimeAuthorityError:
+        raise
+    except Exception as exc:
+        raise RuntimeAuthorityError(
+            "Windows Known Folder lookup failed (FOLDERID_LocalAppData); "
+            "cannot resolve a canonical authority root"
+        ) from exc
+    finally:
+        if path_ptr.value:
+            try:
+                ctypes.windll.ole32.CoTaskMemFree(
+                    ctypes.cast(path_ptr, ctypes.c_void_p)
+                )
+            except Exception:
+                pass
+
+
+def _posix_user_home() -> Path:
+    """Resolve the OS user's home through the user database (no $HOME)."""
     try:
         import pwd
 
-        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    except (ImportError, KeyError, OSError):
-        pass
-    return home / ".local" / "share" / "qmt-execution-core" / "authority"
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except Exception as exc:
+        raise RuntimeAuthorityError(
+            "POSIX user-database home lookup failed; cannot resolve a "
+            "canonical authority root"
+        ) from exc
+    if not home:
+        raise RuntimeAuthorityError(
+            "POSIX user-database home is empty; cannot resolve a canonical "
+            "authority root"
+        )
+    return Path(home)
 
 
 def _require_account_key(account_key: object) -> str:
