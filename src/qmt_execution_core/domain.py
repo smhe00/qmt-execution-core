@@ -36,6 +36,7 @@ class TradeEvent(str, Enum):
     PRECHECK_VERIFIED = "precheck_verified"
     PRECHECK_REJECTED = "precheck_rejected"
     INTENT_PERSISTED = "intent_persisted"
+    PRE_BROKER_REJECTED = "pre_broker_rejected"
     PRE_BROKER_ABORTED = "pre_broker_aborted"
     SUBMIT_ACCEPTED = "submit_accepted"
     SUBMIT_REJECTED = "submit_rejected"
