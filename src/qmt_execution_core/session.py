@@ -45,15 +45,13 @@ class ExecutionSession:
 
     v0.4 preserves the existing ``before_broker_submit`` /
     ``before_broker_cancel`` sidecar API and adds an optional internal-style
-    ``before_submit_coordination`` seam.  Submit ordering is:
+    ``before_submit_coordination`` seam. Submit ordering is:
 
         durable intent -> coordination -> project sidecar -> broker side effect
 
-    All hooks execute synchronously on the calling thread.  If either pre-
+    All hooks execute synchronously on the calling thread. If either pre-
     broker hook raises, broker.place_order has provably not been invoked; the
-    logical execution is transitioned to REJECTED/RESOLVED before the original
-    exception is propagated (or, for a BrokerSubmissionRejected coordination
-    decision, returned as a normal REJECTED snapshot).
+    state machine records that proof before propagating the original exception.
     """
 
     def __init__(
@@ -208,10 +206,7 @@ class ExecutionSession:
         )
 
         # v0.4 shared-account coordination runs after the generic durable
-        # intent but before any project sidecar or broker side effect.  A
-        # BrokerSubmissionRejected is a normal fail-closed local rejection;
-        # any other exception is propagated after recording a resolved local
-        # rejection.  In both cases broker.place_order was never called.
+        # intent but before any project sidecar or broker side effect.
         try:
             self._before_submit_coordination(request)
         except BrokerSubmissionRejected as exc:
@@ -226,7 +221,7 @@ class ExecutionSession:
             return self.snapshot(reason=str(exc))
         except Exception as exc:
             self._transition(
-                TradeEvent.SUBMIT_REJECTED,
+                TradeEvent.PRE_BROKER_ABORTED,
                 details={
                     "reason": str(exc),
                     "source": "before_submit_coordination",
@@ -235,14 +230,14 @@ class ExecutionSession:
             )
             raise
 
-        # Project sidecar remains after core durable intent and before broker
-        # submit. A synchronous failure proves the broker was not called, so
-        # v0.4 records a resolved REJECTED execution before propagating it.
+        # Project sidecar remains after core durable intent/coordination and
+        # before broker submit. A synchronous failure proves the broker was not
+        # called; PRE_BROKER_ABORTED makes FAILED resolved rather than unknown.
         try:
             self._before_broker_submit(request)
         except Exception as exc:
             self._transition(
-                TradeEvent.SUBMIT_REJECTED,
+                TradeEvent.PRE_BROKER_ABORTED,
                 details={
                     "reason": str(exc),
                     "source": "before_broker_submit",
