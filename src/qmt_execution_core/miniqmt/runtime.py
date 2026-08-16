@@ -7,21 +7,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from ..coordinated_session import CoordinatedExecutionSession
+from ..coordination import (
+    CashRequirementEstimator,
+    ExecutionCoordinator,
+    SQLiteExecutionCoordinator,
+    account_key_from_binding_identity,
+)
 from ..domain import ExecutionRequest, ExecutionSnapshot, TradeState
 from ..event_queue import SerialEventQueue
 from ..mutex import ExecutionMutex
 from ..exceptions import (
-    AccountBindingError,
     EventQueueUnhealthy,
     RecoveryAmbiguous,
     RuntimeConfigurationError,
+    SessionIdUnavailable,
 )
 from ..ports import ExecutionGuard
 from ..session import ExecutionSession
 from .adapter import MiniQmtBrokerAdapter, QmtOrderConfig
 from .binding import (
     BoundQmtAccount,
-    QmtAccountBinding,
     load_account_binding,
     qmt_path_fingerprint,
     select_bound_account,
@@ -34,9 +40,11 @@ from .callbacks import (
     QmtCallbackMalformed,
 )
 from .runtime_gate import RuntimeExecutionGate, RuntimeGateConfig
+from .session_id import BoundedSessionIdAllocator, SessionIdLease
 
 
 _ALLOWED_ENVIRONMENTS = {"simulation", "live"}
+_ALLOWED_RUNTIME_LOCK_MODES = {"exclusive", "shared"}
 _RUNTIME_CONFIG_SCHEMA_VERSION = 1
 _RUNTIME_REQUIRED_FIELDS = {
     "schema_version",
@@ -54,6 +62,11 @@ _RUNTIME_OPTIONAL_FIELDS = {
     "query_attempts",
     "query_delay_seconds",
     "event_queue_size",
+    "runtime_lock_mode",
+    "coordination_path",
+    "session_id_pool_start",
+    "session_id_pool_size",
+    "session_id_attempts",
 }
 _RUNTIME_CONFIG_FIELDS = _RUNTIME_REQUIRED_FIELDS | _RUNTIME_OPTIONAL_FIELDS
 
@@ -72,6 +85,11 @@ class MiniQmtRuntimeConfig:
     query_attempts: int = 3
     query_delay_seconds: float = 0.15
     event_queue_size: int = 1024
+    runtime_lock_mode: str = "exclusive"
+    coordination_path: Path | str | None = None
+    session_id_pool_start: int = 100_000_000
+    session_id_pool_size: int = 1_000
+    session_id_attempts: int = 32
 
     def __post_init__(self) -> None:
         if self.environment not in _ALLOWED_ENVIRONMENTS:
@@ -79,6 +97,12 @@ class MiniQmtRuntimeConfig:
         for name in ("qmt_path", "binding_path", "journal_path", "lock_path"):
             value = Path(getattr(self, name)).expanduser()
             object.__setattr__(self, name, value)
+        if self.coordination_path is not None:
+            object.__setattr__(
+                self,
+                "coordination_path",
+                Path(self.coordination_path).expanduser(),
+            )
         if type(self.strategy_name) is not str or not self.strategy_name:
             raise RuntimeConfigurationError("strategy_name must be non-empty")
         if type(self.live_trading_enabled) is not bool:
@@ -97,6 +121,18 @@ class MiniQmtRuntimeConfig:
             raise RuntimeConfigurationError("query_delay_seconds cannot be negative")
         if type(self.event_queue_size) is not int or self.event_queue_size <= 0:
             raise RuntimeConfigurationError("event_queue_size must be positive")
+        if self.runtime_lock_mode not in _ALLOWED_RUNTIME_LOCK_MODES:
+            raise RuntimeConfigurationError(
+                "runtime_lock_mode must be exactly 'exclusive' or 'shared'"
+            )
+        if type(self.session_id_pool_start) is not int or self.session_id_pool_start <= 0:
+            raise RuntimeConfigurationError("session_id_pool_start must be positive")
+        if type(self.session_id_pool_size) is not int or self.session_id_pool_size <= 0:
+            raise RuntimeConfigurationError("session_id_pool_size must be positive")
+        if type(self.session_id_attempts) is not int or self.session_id_attempts <= 0:
+            raise RuntimeConfigurationError("session_id_attempts must be positive")
+        if self.session_id_pool_start + self.session_id_pool_size - 1 > 2_147_483_647:
+            raise RuntimeConfigurationError("session id pool exceeds signed 32-bit range")
 
         RuntimeGateConfig(
             environment=self.environment,
@@ -124,6 +160,11 @@ class MiniQmtRuntimeConfig:
             if not value.is_absolute():
                 value = base / value
             payload[name] = value
+        if payload.get("coordination_path") is not None:
+            value = Path(str(payload["coordination_path"])).expanduser()
+            if not value.is_absolute():
+                value = base / value
+            payload["coordination_path"] = value
         return cls(**payload)
 
 
@@ -136,8 +177,9 @@ class _RuntimeSignals:
 class MiniQmtRuntime:
     """Production-shaped reusable MiniQMT runtime.
 
-    It owns the broker transport, bound account, callback queue, generic
-    ExecutionSession, runtime live gate and disconnect-recovery protocol.
+    ``exclusive`` mode preserves the v0.3 qmt-path-wide safety mutex.
+    ``shared`` mode replaces that coarse exclusion with durable per-symbol/
+    shared-cash coordination plus an OS-lock-backed bounded MiniQMT session id.
     """
 
     def __init__(
@@ -149,7 +191,9 @@ class MiniQmtRuntime:
         broker: MiniQmtBrokerAdapter,
         session: ExecutionSession,
         event_queue: SerialEventQueue,
-        runtime_mutex: ExecutionMutex,
+        runtime_mutex: ExecutionMutex | None,
+        session_id_lease: SessionIdLease | None,
+        session_id: int,
         gate: RuntimeExecutionGate,
         signals: _RuntimeSignals,
         security_account_type: int,
@@ -163,6 +207,8 @@ class MiniQmtRuntime:
         self.session = session
         self.event_queue = event_queue
         self.runtime_mutex = runtime_mutex
+        self.session_id_lease = session_id_lease
+        self.session_id = session_id
         self.gate = gate
         self._signals = signals
         self._security_account_type = security_account_type
@@ -184,6 +230,8 @@ class MiniQmtRuntime:
         auto_open: bool = True,
         before_broker_submit: Callable[[ExecutionRequest], None] | None = None,
         before_broker_cancel: Callable[[int], None] | None = None,
+        coordinator: ExecutionCoordinator | None = None,
+        cash_estimator: CashRequirementEstimator | None = None,
     ) -> "MiniQmtRuntime":
         if not isinstance(config, MiniQmtRuntimeConfig):
             raise RuntimeConfigurationError("config must be MiniQmtRuntimeConfig")
@@ -191,7 +239,10 @@ class MiniQmtRuntime:
         if not qmt_path.is_dir():
             raise RuntimeConfigurationError(f"QMT userdata path does not exist: {qmt_path}")
 
-        if any(item is None for item in (trader_factory, stock_account_factory, xtconstant, callback_base)):
+        if any(
+            item is None
+            for item in (trader_factory, stock_account_factory, xtconstant, callback_base)
+        ):
             real = _real_xtquant_dependencies()
             trader_factory = trader_factory or real["trader_factory"]
             stock_account_factory = stock_account_factory or real["stock_account_factory"]
@@ -212,6 +263,18 @@ class MiniQmtRuntime:
             environment=config.environment,
             qmt_path=qmt_path,
         )
+        if coordinator is None and config.coordination_path is not None:
+            coordinator = SQLiteExecutionCoordinator(config.coordination_path)
+        if config.runtime_lock_mode == "shared" and coordinator is None:
+            raise RuntimeConfigurationError(
+                "shared runtime mode requires coordination_path or injected coordinator"
+            )
+        account_key = account_key_from_binding_identity(
+            environment=binding.environment,
+            account_type=binding.account_type,
+            account_id_sha256=binding.account_id_sha256,
+        )
+
         gate = RuntimeExecutionGate(
             RuntimeGateConfig(
                 environment=config.environment,
@@ -220,7 +283,6 @@ class MiniQmtRuntime:
             )
         )
         signals = _RuntimeSignals()
-
         holder: dict[str, object] = {}
 
         def handle_callback(event: object) -> None:
@@ -254,20 +316,81 @@ class MiniQmtRuntime:
         bridge = QmtCallbackBridge(event_queue.try_emit)
         callback = _make_callback(callback_base, bridge)
 
-        runtime_mutex = ExecutionMutex(_runtime_mutex_path(qmt_path))
-        runtime_mutex.acquire()
+        runtime_mutex: ExecutionMutex | None = None
+        session_id_lease: SessionIdLease | None = None
         trader = None
         session: ExecutionSession | None = None
+        actual_session_id: int | None = None
+
         try:
+            if config.runtime_lock_mode == "exclusive":
+                runtime_mutex = ExecutionMutex(_runtime_mutex_path(qmt_path))
+                runtime_mutex.acquire()
+
             event_queue.start()
-            session_id = config.session_id or secrets.randbelow(900_000_000) + 100_000_000
-            trader = trader_factory(str(qmt_path), session_id)
-            register = getattr(trader, "register_callback", None)
-            if not callable(register):
-                raise RuntimeConfigurationError("XtQuant trader has no register_callback")
-            register(callback)
-            getattr(trader, "start")()
-            _require_exact_zero(getattr(trader, "connect")(), "trader.connect")
+
+            if config.runtime_lock_mode == "shared":
+                allocator = BoundedSessionIdAllocator(
+                    qmt_path,
+                    pool_start=config.session_id_pool_start,
+                    pool_size=config.session_id_pool_size,
+                    attempts=config.session_id_attempts,
+                )
+                if config.session_id is not None:
+                    candidate_ids = (config.session_id,)
+                else:
+                    candidate_ids = allocator.candidate_ids(
+                        f"{config.environment}|{config.strategy_name}"
+                    )
+
+                last_error: Exception | None = None
+                for candidate in candidate_ids:
+                    lease: SessionIdLease | None = None
+                    candidate_trader = None
+                    try:
+                        lease = allocator.acquire_exact(candidate)
+                        candidate_trader = trader_factory(str(qmt_path), candidate)
+                        register = getattr(candidate_trader, "register_callback", None)
+                        if not callable(register):
+                            raise RuntimeConfigurationError(
+                                "XtQuant trader has no register_callback"
+                            )
+                        register(callback)
+                        getattr(candidate_trader, "start")()
+                        _require_exact_zero(
+                            getattr(candidate_trader, "connect")(),
+                            "trader.connect",
+                        )
+                    except Exception as exc:
+                        last_error = exc
+                        if candidate_trader is not None:
+                            _best_effort_stop(candidate_trader)
+                        if lease is not None:
+                            lease.release()
+                        if config.session_id is not None:
+                            raise
+                        continue
+                    trader = candidate_trader
+                    session_id_lease = lease
+                    actual_session_id = candidate
+                    break
+                if trader is None or session_id_lease is None or actual_session_id is None:
+                    raise SessionIdUnavailable(
+                        "shared runtime exhausted bounded session-id attempts"
+                    ) from last_error
+            else:
+                actual_session_id = (
+                    config.session_id
+                    or secrets.randbelow(900_000_000) + 100_000_000
+                )
+                trader = trader_factory(str(qmt_path), actual_session_id)
+                register = getattr(trader, "register_callback", None)
+                if not callable(register):
+                    raise RuntimeConfigurationError("XtQuant trader has no register_callback")
+                register(callback)
+                getattr(trader, "start")()
+                _require_exact_zero(getattr(trader, "connect")(), "trader.connect")
+
             signals.transport_connected = True
 
             bound = select_bound_account(
@@ -305,15 +428,32 @@ class MiniQmtRuntime:
                 initially_connected=True,
                 recovery_ready=False,
             )
-            session = ExecutionSession(
-                broker=broker,
-                guard=guard,
-                journal_path=config.journal_path,
-                lock_path=config.lock_path,
-                execution_id=config.strategy_name,
-                before_broker_submit=before_broker_submit,
-                before_broker_cancel=before_broker_cancel,
-            )
+
+            if coordinator is not None:
+                session = CoordinatedExecutionSession(
+                    broker=broker,
+                    guard=guard,
+                    journal_path=config.journal_path,
+                    lock_path=config.lock_path,
+                    coordinator=coordinator,
+                    account_key=account_key,
+                    account_resource=broker,
+                    cash_estimator=cash_estimator,
+                    execution_id=config.strategy_name,
+                    before_broker_submit=before_broker_submit,
+                    before_broker_cancel=before_broker_cancel,
+                )
+            else:
+                session = ExecutionSession(
+                    broker=broker,
+                    guard=guard,
+                    journal_path=config.journal_path,
+                    lock_path=config.lock_path,
+                    execution_id=config.strategy_name,
+                    before_broker_submit=before_broker_submit,
+                    before_broker_cancel=before_broker_cancel,
+                )
+
             runtime = cls(
                 config=config,
                 trader=trader,
@@ -322,6 +462,8 @@ class MiniQmtRuntime:
                 session=session,
                 event_queue=event_queue,
                 runtime_mutex=runtime_mutex,
+                session_id_lease=session_id_lease,
+                session_id=actual_session_id,
                 gate=gate,
                 signals=signals,
                 security_account_type=security_account_type,
@@ -342,7 +484,10 @@ class MiniQmtRuntime:
             event_queue.join(timeout=1.0)
             if trader is not None:
                 _best_effort_stop(trader)
-            runtime_mutex.release()
+            if session_id_lease is not None:
+                session_id_lease.release()
+            if runtime_mutex is not None:
+                runtime_mutex.release()
             raise
 
     def open(self) -> ExecutionSnapshot:
@@ -390,11 +535,16 @@ class MiniQmtRuntime:
         self._require_not_closed()
         return self.session.next_cycle()
 
-    def recover_after_disconnect(self, *, runtime_token: str | None = None) -> ExecutionSnapshot:
+    def recover_after_disconnect(
+        self,
+        *,
+        runtime_token: str | None = None,
+    ) -> ExecutionSnapshot:
         """Restore transport, account, subscription and durable execution state.
 
         Transport reconnection alone never restores new-order capability.
         """
+
         self._require_not_closed()
         self.gate.revoke()
         self.broker.mark_recovery_required()
@@ -458,7 +608,10 @@ class MiniQmtRuntime:
                 self.event_queue.stop()
                 self.event_queue.join(timeout=1.0)
                 _best_effort_stop(self.trader)
-                self.runtime_mutex.release()
+                if self.session_id_lease is not None:
+                    self.session_id_lease.release()
+                if self.runtime_mutex is not None:
+                    self.runtime_mutex.release()
                 self._closed = True
 
     def _require_not_closed(self) -> None:

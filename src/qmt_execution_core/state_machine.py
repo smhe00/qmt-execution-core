@@ -46,6 +46,8 @@ TRANSITIONS: Mapping[TradeState, Mapping[TradeEvent, TradeState]] = {
         TradeEvent.FATAL: TradeState.FAILED,
     },
     TradeState.SUBMITTED: {
+        TradeEvent.PRE_BROKER_REJECTED: TradeState.REJECTED,
+        TradeEvent.PRE_BROKER_ABORTED: TradeState.FAILED,
         TradeEvent.SUBMIT_ACCEPTED: TradeState.ACCEPTED,
         TradeEvent.SUBMIT_REJECTED: TradeState.REJECTED,
         TradeEvent.SUBMIT_AMBIGUOUS: TradeState.UNKNOWN,
@@ -209,6 +211,17 @@ def advance(
             facts,
             intent_persisted=True,
             reservation_persisted=True,
+        )
+
+    elif event in {TradeEvent.PRE_BROKER_REJECTED, TradeEvent.PRE_BROKER_ABORTED}:
+        # Synchronous pre-broker rejection/failure happened before
+        # BrokerPort.place_order was invoked. Broker reality is therefore
+        # resolved even though the logical execution is terminal.
+        facts = replace(
+            facts,
+            submitted_once=False,
+            unresolved_order=False,
+            terminal_order_confirmed=True,
         )
 
     elif event is TradeEvent.SUBMIT_ACCEPTED:

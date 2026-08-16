@@ -4,14 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qmt-execution-core"
-version = "0.3.1"
-description = "Reusable fail-closed trading execution core with a MiniQMT/XtQuant adapter profile"
+version = "0.4.0"
+description = "Reusable fail-closed trading execution core with MiniQMT/XtQuant shared-account coordination"
 readme = "README.md"
-# Phase A0 evidence (TGrid migration gate): the full suite, compileall,
-# verifier, wheel install + installed-wheel verifier and Windows msvcrt
-# ExecutionMutex cycles all PASS on a real Windows Python 3.9.13 interpreter
-# (66/66, pytest 7.4.4 + iniconfig 2.0.0).  The previous `>=3.11` declaration
-# was conservative, not a real dependency.
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [{name = "smhe00"}]
@@ -27,7 +22,7 @@ classifiers = [
 
 [project.optional-dependencies]
 # pytest 8.x / iniconfig>=2.1 require Python >=3.10; keep 3.9 CI green with
-# the exact tested toolchain (Phase A0).
+# the exact tested toolchain (Phase A0 baseline).
 dev = [
   "pytest==7.4.4; python_version < '3.10'",
   "iniconfig==2.0.0; python_version < '3.10'",

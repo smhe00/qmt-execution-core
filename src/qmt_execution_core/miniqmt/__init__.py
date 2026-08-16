@@ -18,10 +18,12 @@ from .callbacks import (
 )
 from .runtime import MiniQmtRuntime, MiniQmtRuntimeConfig
 from .runtime_gate import RuntimeExecutionGate, RuntimeGateConfig, token_sha256
+from .session_id import BoundedSessionIdAllocator, SessionIdLease
 from .status import QmtOrderStatus, normalize_qmt_order_status
 
 __all__ = [
     "BoundQmtAccount",
+    "BoundedSessionIdAllocator",
     "MiniQmtBrokerAdapter",
     "MiniQmtRuntime",
     "MiniQmtRuntimeConfig",
@@ -38,6 +40,7 @@ __all__ = [
     "QmtTradeObserved",
     "RuntimeExecutionGate",
     "RuntimeGateConfig",
+    "SessionIdLease",
     "account_id_fingerprint",
     "load_account_binding",
     "normalize_qmt_order_status",

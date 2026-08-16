@@ -44,3 +44,19 @@ class EventQueueUnhealthy(ExecutionCoreError):
 
 class RuntimeConfirmationError(ExecutionCoreError):
     pass
+
+
+class CoordinationError(ExecutionCoreError):
+    """Shared-account coordination could not be completed safely."""
+
+
+class SymbolClaimConflict(CoordinationError):
+    """Another unresolved execution owns the same account/symbol claim."""
+
+
+class CashReservationRejected(CoordinationError):
+    """Fresh broker cash minus active reservations cannot fund the request."""
+
+
+class SessionIdUnavailable(RuntimeConfigurationError):
+    """No MiniQMT session id could be leased from the configured bounded pool."""

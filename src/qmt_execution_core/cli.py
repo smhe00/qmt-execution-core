@@ -7,14 +7,20 @@ from pathlib import Path
 
 from .miniqmt.binding import QmtAccountBinding
 from .miniqmt.runtime_gate import token_sha256
-from .verifier import verify_state_machine
+from .verifier import verify_release_model
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="qmt-execution-core")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("verify", help="run explicit-state and source-manifest verification")
+    sub.add_parser(
+        "verify",
+        help=(
+            "run single-process state-machine proof, implementation refinement, "
+            "three-process coordination proof, and source-manifest verification"
+        ),
+    )
 
     binding = sub.add_parser(
         "create-binding",
@@ -34,7 +40,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "verify":
-        print(json.dumps(verify_state_machine(), indent=2, sort_keys=True))
+        print(json.dumps(verify_release_model(), indent=2, sort_keys=True))
         return 0
 
     if args.command == "create-binding":
