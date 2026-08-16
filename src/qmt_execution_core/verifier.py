@@ -5,6 +5,7 @@ from collections import deque
 from pathlib import Path
 
 from .domain import PrecheckEvidence, SessionEvidence, TradeEvent, TradeState
+from .finality import ExecutionFinality, execution_finality
 from .state_machine import (
     InvalidTransition,
     MachineSnapshot,
@@ -27,12 +28,16 @@ PROTECTED_EXECUTION_SOURCES = (
     "mutex.py",
     "recovery.py",
     "session.py",
+    "finality.py",
+    "coordination.py",
+    "coordinated_session.py",
     "verifier.py",
     "miniqmt/status.py",
     "miniqmt/adapter.py",
     "miniqmt/callbacks.py",
     "miniqmt/binding.py",
     "miniqmt/runtime_gate.py",
+    "miniqmt/session_id.py",
     "miniqmt/runtime.py",
 )
 
@@ -66,6 +71,27 @@ def _step(snapshot: MachineSnapshot, event: TradeEvent) -> MachineSnapshot:
     return advance(snapshot, event, **kwargs)
 
 
+def _assert_v04_finality_refinement(snapshot: MachineSnapshot) -> None:
+    """Check frozen v0.4 finality semantics over every reachable snapshot."""
+
+    finality = execution_finality(snapshot)
+    if snapshot.state in {TradeState.UNKNOWN, TradeState.CANCEL_REJECTED}:
+        if finality is not ExecutionFinality.OPEN:
+            raise RuntimeError(
+                f"v0.4 finality violation: {snapshot.state.value} must remain OPEN"
+            )
+    if snapshot.state is TradeState.FAILED and snapshot.facts.unresolved_order:
+        if finality is not ExecutionFinality.QUARANTINED:
+            raise RuntimeError(
+                "v0.4 finality violation: unresolved FAILED must be QUARANTINED"
+            )
+    if snapshot.state in {TradeState.FILLED, TradeState.CANCELLED, TradeState.REJECTED}:
+        if finality is not ExecutionFinality.RESOLVED:
+            raise RuntimeError(
+                f"v0.4 finality violation: {snapshot.state.value} must be RESOLVED"
+            )
+
+
 def verify_state_machine(*, source_root: Path | None = None) -> dict[str, object]:
     initial = initial_snapshot()
     queue = deque([initial])
@@ -76,12 +102,14 @@ def verify_state_machine(*, source_root: Path | None = None) -> dict[str, object
     while queue:
         current = queue.popleft()
         assert_invariants(current)
+        _assert_v04_finality_refinement(current)
         for event in TRANSITIONS[current.state]:
             try:
                 successor = _step(current, event)
             except InvalidTransition:
                 continue
             assert_invariants(successor)
+            _assert_v04_finality_refinement(successor)
             edges.add((current, event, successor))
             reached_declared_edges.add((current.state, event))
             if successor not in reachable:
@@ -96,7 +124,10 @@ def verify_state_machine(*, source_root: Path | None = None) -> dict[str, object
     missing_edges = declared_edges - reached_declared_edges
     missing_states = set(TRANSITIONS) - {snapshot.state for snapshot in reachable}
     if missing_edges:
-        raise RuntimeError(f"unreachable declared transitions: {sorted((s.value, e.value) for s, e in missing_edges)}")
+        raise RuntimeError(
+            f"unreachable declared transitions: "
+            f"{sorted((s.value, e.value) for s, e in missing_edges)}"
+        )
     if missing_states:
         raise RuntimeError(f"unreachable states: {sorted(s.value for s in missing_states)}")
 
@@ -134,6 +165,7 @@ def verify_state_machine(*, source_root: Path | None = None) -> dict[str, object
         "unreachable_transitions": 0,
         "states_without_terminal_path": 0,
         "invariant_violations": 0,
+        "v0_4_finality_invariant_violations": 0,
         "transition_spec_sha256": transition_spec_sha256(),
         "execution_source_sha256": execution_source_sha256(source_root),
     }
@@ -142,7 +174,9 @@ def verify_state_machine(*, source_root: Path | None = None) -> dict[str, object
 def transition_spec_sha256() -> str:
     rows: list[str] = []
     for state in sorted(TRANSITIONS, key=lambda s: s.value):
-        for event, target in sorted(TRANSITIONS[state].items(), key=lambda item: item[0].value):
+        for event, target in sorted(
+            TRANSITIONS[state].items(), key=lambda item: item[0].value
+        ):
             rows.append(f"{state.value}|{event.value}|{target.value}\n")
     return hashlib.sha256("".join(rows).encode("utf-8")).hexdigest()
 
@@ -159,9 +193,7 @@ def _resolve_package_root(source_root: Path | None) -> Path:
     for candidate in candidates:
         if (candidate / "verifier.py").is_file() and (candidate / "domain.py").is_file():
             return candidate
-    raise FileNotFoundError(
-        f"qmt_execution_core package root not found under {root}"
-    )
+    raise FileNotFoundError(f"qmt_execution_core package root not found under {root}")
 
 
 def execution_source_sha256(source_root: Path | None = None) -> str:
@@ -174,6 +206,8 @@ def execution_source_sha256(source_root: Path | None = None) -> str:
         canonical_name = f"qmt_execution_core/{relative}"
         digest.update(canonical_name.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n"))
+        digest.update(
+            path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        )
         digest.update(b"\0")
     return digest.hexdigest()
