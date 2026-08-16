@@ -211,7 +211,7 @@ class ExecutionSession:
             self._before_submit_coordination(request)
         except BrokerSubmissionRejected as exc:
             self._transition(
-                TradeEvent.SUBMIT_REJECTED,
+                TradeEvent.PRE_BROKER_REJECTED,
                 details={
                     "reason": str(exc),
                     "source": "before_submit_coordination",
