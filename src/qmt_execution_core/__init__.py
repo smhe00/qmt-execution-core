@@ -32,7 +32,7 @@ from .finality import ExecutionFinality, execution_finality
 from .guards import ExecutionLimits, LimitExecutionGuard
 from .ports import AccountResourcePort, BrokerPort, ExecutionGuard
 from .session import ExecutionSession
-from .verifier import verify_state_machine
+from .verifier import verify_release_model, verify_state_machine
 
 __all__ = [
     "AccountResourcePort",
@@ -68,5 +68,6 @@ __all__ = [
     "TradeState",
     "account_key_from_binding_identity",
     "execution_finality",
+    "verify_release_model",
     "verify_state_machine",
 ]
