@@ -43,13 +43,17 @@ class ExecutionSession:
     The session owns its execution mutex for the whole open lifetime. Releasing
     the mutex via `close()` irreversibly disables further calls on this object.
 
-    ``before_broker_submit`` / ``before_broker_cancel`` are broker-neutral
-    sidecar lifecycle hooks (TGrid migration Phase A): they execute
-    synchronously on the execution (calling) thread AFTER the core durable
-    intent / cancel-intent is persisted and BEFORE the broker side effect.
-    A raised hook proves the broker call was never invoked and fails closed;
-    a hook must never create a blind-retry path from UNKNOWN.  Defaults are
-    no-ops so existing callers are unchanged.
+    v0.4 preserves the existing ``before_broker_submit`` /
+    ``before_broker_cancel`` sidecar API and adds an optional internal-style
+    ``before_submit_coordination`` seam.  Submit ordering is:
+
+        durable intent -> coordination -> project sidecar -> broker side effect
+
+    All hooks execute synchronously on the calling thread.  If either pre-
+    broker hook raises, broker.place_order has provably not been invoked; the
+    logical execution is transitioned to REJECTED/RESOLVED before the original
+    exception is propagated (or, for a BrokerSubmissionRejected coordination
+    decision, returned as a normal REJECTED snapshot).
     """
 
     def __init__(
@@ -60,9 +64,14 @@ class ExecutionSession:
         journal_path: Path | str,
         lock_path: Path | str,
         execution_id: str = "default",
+        before_submit_coordination: Callable[[ExecutionRequest], None] | None = None,
         before_broker_submit: Callable[[ExecutionRequest], None] | None = None,
         before_broker_cancel: Callable[[int], None] | None = None,
     ) -> None:
+        if before_submit_coordination is not None and not callable(
+            before_submit_coordination
+        ):
+            raise TypeError("before_submit_coordination must be callable or None")
         if before_broker_submit is not None and not callable(before_broker_submit):
             raise TypeError("before_broker_submit must be callable or None")
         if before_broker_cancel is not None and not callable(before_broker_cancel):
@@ -71,6 +80,9 @@ class ExecutionSession:
         self.guard = guard
         self.journal = ExecutionJournal(journal_path, execution_id=execution_id)
         self.mutex = ExecutionMutex(lock_path)
+        self._before_submit_coordination: Callable[[ExecutionRequest], None] = (
+            before_submit_coordination or _noop_submit
+        )
         self._before_broker_submit: Callable[[ExecutionRequest], None] = (
             before_broker_submit or _noop_submit
         )
@@ -143,7 +155,10 @@ class ExecutionSession:
             elif self._snapshot.state is TradeState.UNKNOWN:
                 self._recover_unknown()
             else:
-                self._transition(TradeEvent.FATAL, details={"reason": "interrupted pre-submit state"})
+                self._transition(
+                    TradeEvent.FATAL,
+                    details={"reason": "interrupted pre-submit state"},
+                )
 
             self._open = True
             return self.snapshot()
@@ -192,12 +207,49 @@ class ExecutionSession:
             details={"client_order_id": request.client_order_id},
         )
 
-        # Phase A sidecar seam: runs AFTER the core durable intent is
-        # committed and BEFORE BrokerPort.place_order(). A raised hook
-        # propagates out of submit() and proves the broker submit was NEVER
-        # invoked (fail closed); the durable intent makes restart recovery
-        # fail closed (no blind resend).
-        self._before_broker_submit(request)
+        # v0.4 shared-account coordination runs after the generic durable
+        # intent but before any project sidecar or broker side effect.  A
+        # BrokerSubmissionRejected is a normal fail-closed local rejection;
+        # any other exception is propagated after recording a resolved local
+        # rejection.  In both cases broker.place_order was never called.
+        try:
+            self._before_submit_coordination(request)
+        except BrokerSubmissionRejected as exc:
+            self._transition(
+                TradeEvent.SUBMIT_REJECTED,
+                details={
+                    "reason": str(exc),
+                    "source": "before_submit_coordination",
+                    "broker_invoked": False,
+                },
+            )
+            return self.snapshot(reason=str(exc))
+        except Exception as exc:
+            self._transition(
+                TradeEvent.SUBMIT_REJECTED,
+                details={
+                    "reason": str(exc),
+                    "source": "before_submit_coordination",
+                    "broker_invoked": False,
+                },
+            )
+            raise
+
+        # Project sidecar remains after core durable intent and before broker
+        # submit. A synchronous failure proves the broker was not called, so
+        # v0.4 records a resolved REJECTED execution before propagating it.
+        try:
+            self._before_broker_submit(request)
+        except Exception as exc:
+            self._transition(
+                TradeEvent.SUBMIT_REJECTED,
+                details={
+                    "reason": str(exc),
+                    "source": "before_broker_submit",
+                    "broker_invoked": False,
+                },
+            )
+            raise
 
         try:
             order_id = self.broker.place_order(request)
@@ -261,10 +313,6 @@ class ExecutionSession:
 
         self.journal.persist_cancel_intent()
         self._transition(TradeEvent.CANCEL_REQUESTED)
-        # Phase A sidecar seam: runs AFTER the core durable cancel-intent is
-        # committed and BEFORE BrokerPort.cancel_order(). A raised hook
-        # propagates and proves the broker cancel was NEVER invoked (fail
-        # closed); the durable cancel intent makes restart recovery safe.
         self._before_broker_cancel(order_id)
         try:
             result = self.broker.cancel_order(order_id)
@@ -288,7 +336,11 @@ class ExecutionSession:
     def snapshot(self, *, reason: str = "") -> ExecutionSnapshot:
         data = self.journal.data if self.journal.is_open else {}
         intent = data.get("intent") if isinstance(data.get("intent"), dict) else {}
-        observation = data.get("last_observation") if isinstance(data.get("last_observation"), dict) else {}
+        observation = (
+            data.get("last_observation")
+            if isinstance(data.get("last_observation"), dict)
+            else {}
+        )
         order_id = data.get("broker_order_id")
         return ExecutionSnapshot(
             state=self._snapshot.state,
@@ -296,7 +348,9 @@ class ExecutionSession:
             broker_order_id=order_id if type(order_id) is int else None,
             ordered_qty=int(intent.get("qty", 0)) if intent else 0,
             filled_qty=int(observation.get("filled_qty", 0)) if observation else 0,
-            average_fill_price=observation.get("average_fill_price") if observation else None,
+            average_fill_price=(
+                observation.get("average_fill_price") if observation else None
+            ),
             reason=reason,
         )
 
@@ -319,7 +373,13 @@ class ExecutionSession:
                     order_remark=str(intent["order_remark"]),
                 )
                 self.journal.persist_broker_order_id(order.order_id)
-        except (BrokerQueryAmbiguous, RecoveryAmbiguous, KeyError, TypeError, ValueError) as exc:
+        except (
+            BrokerQueryAmbiguous,
+            RecoveryAmbiguous,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
             self._transition(TradeEvent.RECOVERY_FAILED, details={"reason": str(exc)})
             return self.snapshot(reason=str(exc))
         return self._apply_observation(order)
@@ -364,7 +424,9 @@ class ExecutionSession:
             raise RecoveryAmbiguous("broker order exists without durable local intent")
         durable_order_id = data.get("broker_order_id")
         if type(durable_order_id) is int and order.order_id != durable_order_id:
-            raise RecoveryAmbiguous("broker order id conflicts with durable broker_order_id")
+            raise RecoveryAmbiguous(
+                "broker order id conflicts with durable broker_order_id"
+            )
         if (
             order.symbol != intent.get("symbol")
             or order.side.value != intent.get("side")
@@ -387,10 +449,18 @@ class ExecutionSession:
             return
         self._transition(TradeEvent.FATAL, details={"reason": reason})
 
-    def _transition(self, event: TradeEvent, *, details: dict | None = None, **kwargs) -> None:
+    def _transition(
+        self,
+        event: TradeEvent,
+        *,
+        details: dict | None = None,
+        **kwargs,
+    ) -> None:
         self._snapshot = advance(self._snapshot, event, **kwargs)
         self.journal.transition(event, self._snapshot, details=details)
 
     def _require_open(self) -> None:
         if not self._open or self._closed or not self.mutex.owned:
-            raise SessionClosedError("execution session is not open or no longer owns its mutex")
+            raise SessionClosedError(
+                "execution session is not open or no longer owns its mutex"
+            )
