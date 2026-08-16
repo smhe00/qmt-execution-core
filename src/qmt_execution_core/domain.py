@@ -36,6 +36,7 @@ class TradeEvent(str, Enum):
     PRECHECK_VERIFIED = "precheck_verified"
     PRECHECK_REJECTED = "precheck_rejected"
     INTENT_PERSISTED = "intent_persisted"
+    PRE_BROKER_ABORTED = "pre_broker_aborted"
     SUBMIT_ACCEPTED = "submit_accepted"
     SUBMIT_REJECTED = "submit_rejected"
     SUBMIT_AMBIGUOUS = "submit_ambiguous"
@@ -201,11 +202,19 @@ class BrokerOrder:
             raise ValueError("filled_qty must be within [0, qty]")
         if not isinstance(self.status, BrokerOrderStatus):
             object.__setattr__(self, "status", BrokerOrderStatus(self.status))
-        for name in ("order_remark", "client_order_id", "strategy_name", "order_sysid", "status_message"):
+        for name in (
+            "order_remark",
+            "client_order_id",
+            "strategy_name",
+            "order_sysid",
+            "status_message",
+        ):
             if type(getattr(self, name)) is not str:
                 raise ValueError(f"{name} must be a string")
         if self.average_fill_price is not None:
-            if type(self.average_fill_price) not in (int, float) or isinstance(self.average_fill_price, bool):
+            if type(self.average_fill_price) not in (int, float) or isinstance(
+                self.average_fill_price, bool
+            ):
                 raise ValueError("average_fill_price must be numeric or None")
             if not isfinite(float(self.average_fill_price)) or self.average_fill_price < 0:
                 raise ValueError("average_fill_price must be finite and non-negative")
