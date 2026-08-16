@@ -3,6 +3,7 @@
 ## 0.4.0
 
 - Added additive `ExecutionFinality` semantics: `OPEN`, `RESOLVED`, and `QUARANTINED`.
+- Added explicit `PRE_BROKER_REJECTED` for local fail-closed rejection before broker invocation; it remains `REJECTED` without falsely setting `submitted_once`.
 - Added explicit `PRE_BROKER_ABORTED` refinement so synchronous pre-broker failures are distinguishable from unresolved broker ambiguity.
 - Added SQLite-backed cross-process `(account_key, symbol)` execution claims.
 - Added atomic shared BUY cash reservations using fresh broker cash minus active same-account reservations.
