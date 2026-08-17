@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "environment": "simulation",
+  "qmt_path": "C:/CHANGE_ME/userdata_mini",
+  "binding_path": "config/sim-binding.local.json",
+  "journal_path": "runtime/quickstart.journal.json",
+  "lock_path": "runtime/quickstart.lock",
+  "strategy_name": "quickstart",
+  "live_trading_enabled": false,
+  "confirmation_token_sha256": "",
+  "session_id": null,
+  "query_attempts": 3,
+  "query_delay_seconds": 0.15,
+  "event_queue_size": 1024,
+  "runtime_lock_mode": "shared",
+  "session_id_pool_start": 100000000,
+  "session_id_pool_size": 1000,
+  "session_id_attempts": 32
+}
