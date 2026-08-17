@@ -324,6 +324,8 @@ CashRequirementEstimator
 
 ## 9. 创建 Runtime
 
+下面代码只展示接口关系，`my_guard` / `my_cash_estimator` 是调用方需要实现的对象，**不是可以直接复制运行的完整程序**。完整的 fail-closed 集成骨架见 [`examples/project_integration.py`](../examples/project_integration.py)，通用 0.4.1 runtime 配置模板见 [`examples/runtime_config.example.json`](../examples/runtime_config.example.json)。
+
 ```python
 from qmt_execution_core.miniqmt import MiniQmtRuntime, MiniQmtRuntimeConfig
 
