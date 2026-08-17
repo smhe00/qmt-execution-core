@@ -47,7 +47,7 @@ def main() -> int:
     guard = LimitExecutionGuard(
         QuickStartBlockingGuard(),
         ExecutionLimits(
-            allowlist=frozenset(),
+            allowlist=frozenset({"510300.SH"}),
             max_order_qty=1,
             max_order_notional=1.0,
         ),
