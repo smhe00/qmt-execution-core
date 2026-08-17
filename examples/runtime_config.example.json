@@ -1,15 +1,19 @@
 {
   "schema_version": 1,
   "environment": "simulation",
-  "qmt_path": "C:/path/to/userdata_mini",
-  "binding_path": "../config/account-binding.local.json",
-  "journal_path": "../runtime/demo-journal.json",
-  "lock_path": "../runtime/demo-execution.lock",
-  "strategy_name": "demo",
+  "qmt_path": "C:/CHANGE_ME/userdata_mini",
+  "binding_path": "config/sim-binding.local.json",
+  "journal_path": "runtime/my_strategy.journal.json",
+  "lock_path": "runtime/my_strategy.lock",
+  "strategy_name": "my_strategy",
   "live_trading_enabled": false,
   "confirmation_token_sha256": "",
   "session_id": null,
   "query_attempts": 3,
   "query_delay_seconds": 0.15,
-  "event_queue_size": 1024
+  "event_queue_size": 1024,
+  "runtime_lock_mode": "shared",
+  "session_id_pool_start": 100000000,
+  "session_id_pool_size": 1000,
+  "session_id_attempts": 32
 }
