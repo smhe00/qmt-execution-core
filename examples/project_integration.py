@@ -1,9 +1,11 @@
 """Minimal project-side integration example.
 
 This file is documentation/example code. It does not enable real-money trading.
+The example guard intentionally rejects every execution request.
 """
 
 from qmt_execution_core import (
+    ConservativeCashRequirementEstimator,
     ExecutionLimits,
     ExecutionRequest,
     LimitExecutionGuard,
@@ -47,9 +49,22 @@ guard = LimitExecutionGuard(
     ),
 )
 
+# Example only. Replace these values with a conservative market/account policy
+# before allowing BUY execution in a real strategy.
+cash_estimator = ConservativeCashRequirementEstimator(
+    fee_rate=0.001,
+    minimum_fee=5.0,
+    temporary_withholding_buffer=100.0,
+    safety_buffer=50.0,
+)
+
 # This connects/query/subscribes and opens the durable execution session.
 # The example ProjectGuard above intentionally prevents any order submission.
-runtime = MiniQmtRuntime.connect(config, guard=guard)
+runtime = MiniQmtRuntime.connect(
+    config,
+    guard=guard,
+    cash_estimator=cash_estimator,
+)
 try:
     ...
 finally:
