@@ -1,7 +1,7 @@
 """Read-only MiniQMT account probe for the beginner User Guide.
 
 This helper connects to the local QMT client, reads account discovery/status,
-and prints the account_type for the account ID entered by the operator.
+and reports the account_type for the account ID entered by the operator.
 It never subscribes an account and never calls any order/cancel API.
 """
 
@@ -29,6 +29,7 @@ def main() -> int:
         raise RuntimeError(f"QMT userdata path does not exist: {qmt_path}")
 
     try:
+        from xtquant import xtconstant
         from xtquant.xttrader import XtQuantTrader
     except ImportError as exc:
         raise RuntimeError(
@@ -38,6 +39,9 @@ def main() -> int:
     account_id = getpass.getpass("MiniQMT account id (input hidden): ").strip()
     if not account_id:
         raise RuntimeError("account id cannot be empty")
+
+    security_account_type = int(getattr(xtconstant, "SECURITY_ACCOUNT"))
+    account_status_ok = int(getattr(xtconstant, "ACCOUNT_STATUS_OK"))
 
     session_id = secrets.randbelow(900_000_000) + 100_000_000
     trader = XtQuantTrader(str(qmt_path), session_id)
@@ -70,20 +74,36 @@ def main() -> int:
             )
 
         account_type = matches[0]
-        healthy_matches = 0
+        healthy = False
         for status in statuses:
             try:
                 sid = str(getattr(status, "account_id"))
                 stype = int(getattr(status, "account_type"))
+                svalue = int(getattr(status, "status"))
             except (AttributeError, TypeError, ValueError):
                 continue
-            if sid == account_id and stype == account_type:
-                healthy_matches += 1
+            if (
+                sid == account_id
+                and stype == account_type
+                and svalue == account_status_ok
+            ):
+                healthy = True
+                break
+
+        security_account = account_type == security_account_type
 
         print(f"[PASS] account found: {_mask(account_id)}")
-        print(f"[PASS] account_type = {account_type}")
-        print(f"[INFO] matching status records = {healthy_matches}")
+        print(f"[INFO] account_type = {account_type}")
+        print(f"[INFO] security_account = {security_account}")
+        print(f"[INFO] healthy = {healthy}")
         print("[SAFE] read-only probe complete; no subscribe/order/cancel was called")
+
+        if not security_account:
+            raise RuntimeError(
+                "this account is not the securities account type expected by MiniQmtRuntime"
+            )
+        if not healthy:
+            raise RuntimeError("the selected account is not reported healthy by QMT")
         return 0
     finally:
         try:
