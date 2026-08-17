@@ -1,26 +1,25 @@
-# 文档归档
+# Archived Documentation
 
-本目录保存 `qmt-execution-core` 的旧冻结规格、审计记录、实现任务、验证证据，以及 2026-08-17 文档收敛前的分散说明。
+This directory contains superseded specifications, implementation tasks, audits, evidence, and pre-consolidation user/runtime guides.
 
-## 当前权威文档
+These files are preserved for historical traceability. They are **not** the current product or usage entrypoints.
 
-请返回上一级阅读：
+Current authoritative documents:
 
-- [`../USER_GUIDE.md`](../USER_GUIDE.md)
-- [`../SPECIFICATION.md`](../SPECIFICATION.md)
-- [`../OPERATIONS.md`](../OPERATIONS.md)
+- [`../USER_GUIDE.md`](../USER_GUIDE.md) — first-time setup, safe MiniQMT connection, strategy / coding-agent integration.
+- [`../SPECIFICATION.md`](../SPECIFICATION.md) — current product contract and safety invariants.
+- [`../OPERATIONS.md`](../OPERATIONS.md) — runtime operations, recovery, Runtime Authority, live gate and fault handling.
 
-根目录：
+Archive layout:
 
-- [`../../README.md`](../../README.md)
-- [`../../AGENTS.md`](../../AGENTS.md)
-- [`../../CHANGELOG.md`](../../CHANGELOG.md)
+```text
+v0.4/
+  frozen 0.4 specification, architecture, state-machine/runtime profiles,
+  audits and implementation evidence
 
-## 归档规则
+v0.4.1/
+  Runtime Authority delta specification, audits, implementation tasks/evidence,
+  and the pre-consolidation QUICK_START / USER_API documents
+```
 
-- `v0.4/`：0.4 frozen spec、架构/状态机/MiniQMT/运行时旧文档、审计和实现证据。
-- `v0.4.1/`：Runtime Authority 增量规格、审计、实现任务、实现证据，以及文档收敛前的 Quick Start / User API。
-
-归档文件保持原始内容，主要用于审计、追溯和比较。**不要把归档中的旧配置/API 文案当作当前 production guidance。**
-
-特别是 0.4 文档中允许 strategy 直接配置 `coordination_path` 的说明，已经被 0.4.1 Runtime Authority 模型取代。
+When archived material conflicts with the current three documents, follow the current documents and current source/tests. Do not use archived `coordination_path` guidance for production shared runtime in Core 0.4.1.
