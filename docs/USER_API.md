@@ -2,6 +2,8 @@
 
 本文只说明**策略使用者需要调用的接口**。内部状态机、SQLite coordination、Runtime Authority、session-id 等实现细节不展开。
 
+> 第一次使用 MiniQMT + Core？请先按 [`QUICK_START.md`](QUICK_START.md) 完成模拟账户连接验证，再阅读本文。
+
 ## 1. 第一次使用
 
 ### 检查安装
