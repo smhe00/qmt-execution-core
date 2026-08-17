@@ -1,18 +1,18 @@
 # qmt-execution-core 用户接口
 
-本文只说明**策略使用者真正需要调用的接口**。内部状态机、SQLite coordination、Runtime Authority、session-id 等实现细节不在这里展开。
+本文只说明**策略使用者需要调用的接口**。内部状态机、SQLite coordination、Runtime Authority、session-id 等实现细节不展开。
 
 ## 1. 第一次使用
 
-### 1.1 检查安装
+### 检查安装
 
 ```bash
 qmt-execution-core verify
 ```
 
-要求返回 release verification PASS。
+要求 release verification PASS。
 
-### 1.2 创建账户绑定
+### 创建账户绑定
 
 ```bash
 qmt-execution-core create-binding \
@@ -24,7 +24,7 @@ qmt-execution-core create-binding \
 
 `binding.json` 保存账户指纹，不保存明文账户 ID。
 
-### 1.3 初始化账户 Runtime Authority
+### 初始化账户 Runtime Authority
 
 shared runtime 第一次使用该账户时执行一次：
 
@@ -32,7 +32,7 @@ shared runtime 第一次使用该账户时执行一次：
 qmt-execution-core bootstrap-authority --binding binding.json
 ```
 
-以后普通策略启动只验证已有 Authority，不自动重建。
+之后普通策略启动只验证已有 Authority，不自动重建。
 
 ---
 
@@ -58,7 +58,7 @@ runtime = MiniQmtRuntime.connect(
 )
 ```
 
-推荐多策略/同账户场景使用 `runtime_lock_mode="shared"`。
+多策略共用同一账户时推荐 `runtime_lock_mode="shared"`。
 
 用户**不要配置或自行选择** `coordination_path`、`authority_root`。
 
@@ -86,29 +86,31 @@ snapshot = runtime.submit(request)
 
 ---
 
-## 4. 订单生命周期
-
-普通策略主要只需要下面 6 个接口：
+## 4. 运行时只需要 6 个方法
 
 ```python
 runtime.submit(request)             # 提交一笔新 execution
 runtime.poll()                      # 查询/推进当前 execution
 runtime.cancel()                    # 请求撤销当前 execution
-runtime.next_cycle()                # 当前 execution 权威结束后进入下一周期
+runtime.next_cycle()                # 当前 execution 明确结束后进入下一周期
 runtime.recover_after_disconnect()  # QMT 断线后的恢复与 reconciliation
 runtime.close()                     # 关闭 runtime 并释放资源
 ```
 
-典型流程：
+典型使用方式：
 
 ```python
 snapshot = runtime.submit(request)
+snapshot = runtime.poll()
 
-while snapshot.state.value not in {"filled", "cancelled", "rejected"}:
-    snapshot = runtime.poll()
-
-runtime.next_cycle()
-runtime.close()
+if snapshot.state.value in {"working", "partially_filled"}:
+    # 继续 poll，或根据策略决定 cancel
+    pass
+elif snapshot.state.value in {"filled", "cancelled", "rejected"}:
+    runtime.next_cycle()
+elif snapshot.state.value in {"unknown", "cancel_rejected", "failed"}:
+    # 不要重新 submit；先通过 Core 恢复/对账
+    pass
 ```
 
 不要直接调用 XtQuant 的 `order_stock()` / `cancel_order_stock()` 绕过 Core。
@@ -117,7 +119,7 @@ runtime.close()
 
 ## 5. 返回结果
 
-所有执行接口主要返回 `ExecutionSnapshot`：
+执行接口主要返回 `ExecutionSnapshot`：
 
 ```python
 snapshot.state
@@ -142,17 +144,19 @@ CANCEL_REJECTED
 FAILED
 ```
 
-`UNKNOWN`、`CANCEL_REJECTED` 或其他 broker reality 不明确状态，**不要重新 submit 同一交易**；继续通过 Core reconciliation/recovery 处理。
+其中：
+
+- `FILLED / CANCELLED / REJECTED`：该订单生命周期已明确结束；
+- `WORKING / PARTIALLY_FILLED`：订单仍在进行；
+- `UNKNOWN / CANCEL_REJECTED / FAILED`：**不要重新提交同一交易**，先让 Core 恢复/对账。
 
 ---
 
-## 6. 策略需要提供的两个接口
-
-Core 不决定策略逻辑，因此调用方通常需要提供：
+## 6. 策略需要提供两个接口
 
 ### `ExecutionGuard`
 
-负责判断这笔交易是否允许执行，例如：账户、环境、持仓、价格、策略风险条件等。
+判断这笔交易是否允许执行，例如账户、环境、持仓、价格、策略风险条件。
 
 ### `CashRequirementEstimator`
 
@@ -176,13 +180,11 @@ A 股、港股、港股通等费用规则由上层策略/项目提供，Core 不
 runtime.confirm_live(token)
 ```
 
-`confirm_live()` 只确认 live gate；它不会绕过 `ExecutionGuard`、账户验证、Runtime Authority、资金 reservation 或其他 Core 安全检查。
+`confirm_live()` 只确认 live gate，不会绕过账户验证、`ExecutionGuard`、资金 reservation 或其他安全检查。
 
 ---
 
-## 8. 用户应该依赖的稳定接口
-
-策略代码优先只依赖：
+## 8. 普通策略应依赖的接口
 
 ```text
 MiniQmtRuntime
@@ -191,11 +193,18 @@ ExecutionRequest
 ExecutionSnapshot
 Side
 TradeState
-ExecutionFinality
 ExecutionGuard
 CashRequirementEstimator
 ```
 
-`SQLiteExecutionCoordinator`、`AccountRuntimeAuthority`、`SessionIdLease`、`SerialEventQueue` 等属于高级/内部接口，普通策略不要直接使用。
+以下属于高级/内部接口，普通策略不要直接使用：
 
-更详细的架构和内部机制请阅读根目录 `README.md` 和 `docs/` 下的设计文档。
+```text
+SQLiteExecutionCoordinator
+AccountRuntimeAuthority
+SessionIdLease
+SerialEventQueue
+CoordinationDbIdentity
+```
+
+更多内部设计请阅读根目录 `README.md` 和 `docs/` 下的开发文档。
