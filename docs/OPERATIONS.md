@@ -51,7 +51,7 @@ binding 不保存明文账户号：
 首次初始化：
 
 ```bash
-qmt-execution-core bootstrap-authority --binding config/sim-binding.json
+qmt-execution-core bootstrap-authority --binding config/sim-binding.local.json
 ```
 
 Authority 认证：
