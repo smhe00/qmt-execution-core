@@ -83,6 +83,30 @@ qmt-execution-core verify
 
 只有 release verification 为 PASS，才继续下一步。
 
+### 如果提示 `qmt-execution-core` 不是可识别的命令
+
+这通常只是 Python 的 `Scripts` 目录没有加入 PATH，不代表 Core 没安装成功。
+
+可以直接改用：
+
+```bash
+python -m qmt_execution_core.cli verify
+```
+
+本文后面所有：
+
+```text
+qmt-execution-core <command> ...
+```
+
+都可以等价写成：
+
+```text
+python -m qmt_execution_core.cli <command> ...
+```
+
+参数保持不变。
+
 ---
 
 ## 4. 只读探测当前 QMT 账户
@@ -138,6 +162,12 @@ healthy = True
 qmt-execution-core create-binding --environment simulation --account-type <ACCOUNT_TYPE> --qmt-path "D:\某券商QMT模拟交易端\userdata_mini" --output "config\sim-binding.local.json"
 ```
 
+如果上一节需要使用 `python -m` 形式，这里对应写成：
+
+```bash
+python -m qmt_execution_core.cli create-binding --environment simulation --account-type <ACCOUNT_TYPE> --qmt-path "D:\某券商QMT模拟交易端\userdata_mini" --output "config\sim-binding.local.json"
+```
+
 命令会再次要求输入 MiniQMT 账户 ID。
 
 Core 写入的是账户指纹，不会把明文账户 ID 保存到 binding 文件。
@@ -158,6 +188,12 @@ config\sim-binding.local.json
 
 ```bash
 qmt-execution-core bootstrap-authority --binding "config\sim-binding.local.json"
+```
+
+如果使用 `python -m` 形式：
+
+```bash
+python -m qmt_execution_core.cli bootstrap-authority --binding "config\sim-binding.local.json"
 ```
 
 成功后，这个账户会拥有自己的唯一 Core coordination domain。
@@ -259,6 +295,9 @@ Python
 
 **`xtquant is not installed`**  
 回到第 2 节。Core 不会从 PyPI 安装 `xtquant`，它来自本地 MiniQMT 环境。
+
+**`qmt-execution-core` is not recognized / 不是可识别的命令**  
+回到第 3 节，改用 `python -m qmt_execution_core.cli ...`。
 
 **account binding mismatch / expected account**  
 当前 QMT 登录账户与创建 binding 时输入的账户不一致。
